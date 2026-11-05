@@ -1,0 +1,75 @@
+# Builds the DLL on every push and pull request. A version tag (v0.7.1) also publishes a release.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check the version matches the tag
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          $want = $env:GITHUB_REF_NAME.TrimStart('v')
+          $line = Select-String -Path src/grailtrackrr.cpp -Pattern 'PluginVersion = "([^"]+)"'
+          $have = $line.Matches[0].Groups[1].Value
+          if ($have -ne $want) { throw "Tag $env:GITHUB_REF_NAME but PluginVersion is $have. Update src/grailtrackrr.cpp." }
+
+      - name: Install Ninja
+        run: choco install ninja -y --no-progress
+
+      - name: Build
+        shell: pwsh
+        run: .\build.ps1 -SkipTools
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { "dev-$($env:GITHUB_SHA.Substring(0,7))" }
+          Copy-Item README.md, LICENSE.md dist\
+          $zip = "grailtrackrr-plugin-$name.zip"
+          Compress-Archive -Path dist\* -DestinationPath $zip
+          "ZIP=$zip" | Out-File $env:GITHUB_ENV -Append
+          "DLL_SHA=$((Get-FileHash dist\d2rl-grailtrackrr.dll -Algorithm SHA256).Hash.ToLower())" | Out-File $env:GITHUB_ENV -Append
+          "ZIP_SHA=$((Get-FileHash $zip -Algorithm SHA256).Hash.ToLower())" | Out-File $env:GITHUB_ENV -Append
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP }}
+          path: ${{ env.ZIP }}
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $prev = git describe --tags --abbrev=0 "$($env:GITHUB_REF_NAME)^" 2>$null
+          $range = if ($prev) { "$prev..$($env:GITHUB_REF_NAME)" } else { $env:GITHUB_REF_NAME }
+          $changes = (git log --no-merges --pretty='- %s' $range | Select-Object -First 30) -join "`n"
+          $notes = @"
+          ## Changes
+          $changes
+
+          ## Install
+          Copy ``d2rl-grailtrackrr.dll`` into ``<game folder>\d2rloader\plugins``. Setup steps are in the [README](https://github.com/$($env:GITHUB_REPOSITORY)#install).
+
+          ## SHA-256
+          - ``d2rl-grailtrackrr.dll``: ``$($env:DLL_SHA)``
+          - ``$($env:ZIP)``: ``$($env:ZIP_SHA)``
+          "@
+          $notes | Out-File notes.md -Encoding utf8
+          gh release create $env:GITHUB_REF_NAME $env:ZIP --title "GrailTrackrr plugin $($env:GITHUB_REF_NAME)" --notes-file notes.md
