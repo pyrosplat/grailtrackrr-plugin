@@ -44,7 +44,7 @@
 
 namespace fs = std::filesystem;
 
-static constexpr const char* PluginVersion = "0.8.2";
+static constexpr const char* PluginVersion = "0.8.3";
 
 static constexpr D2RL::PluginInfo GrailTrackrrInfo {
 	.infoSize    = D2RL::PluginInfoSize,
@@ -2200,7 +2200,8 @@ static auto QualityFromName(const std::string& q) -> D2RL::Items::Quality {
 	return D2RL::Items::Quality::Normal;
 }
 
-// Game thread: create the items on the ground at the player's feet.
+// Game thread: create the items in the inventory, else the personal stash, else the Cube.
+// Not on the ground: dropping there trips a game assertion (BC_ASSERT hRoom) in some places.
 static void __cdecl SpawnOnGameThread(const D2RL::PluginContext* context, void* user) noexcept {
 	auto* job = static_cast<SpawnJob*>(user);
 	try {
@@ -2220,7 +2221,6 @@ static void __cdecl SpawnOnGameThread(const D2RL::PluginContext* context, void* 
 			spec.socketCount     = 0;
 			spec.stateFlags      = D2RL::Items::ItemStateIdentified | (s.eth ? D2RL::Items::ItemStateEthereal : 0U);
 			spec.destination.structSize = D2RL::Items::ItemDestinationSize;
-			spec.destination.container  = D2RL::Items::ItemContainer::Ground;
 			spec.destination.placement  = D2RL::Items::Placement::Automatic;
 			D2RL::ItemHandle handle {};
 			{
@@ -2228,7 +2228,14 @@ static void __cdecl SpawnOnGameThread(const D2RL::PluginContext* context, void* 
 				std::lock_guard guard(g.lock);
 				g.spawnedPending[SpawnSignature(s.code, s.quality, s.row)] = NowMs() + 30 * 60'000;
 			}
-			const auto result = g.items->createItem(context, job->player, &spec, &handle);
+			auto result = D2RL::Items::Result::Unavailable;
+			for (const auto container : { D2RL::Items::ItemContainer::Inventory, D2RL::Items::ItemContainer::PersonalStash, D2RL::Items::ItemContainer::Cube }) {
+				spec.destination.container = container;
+				result                     = g.items->createItem(context, job->player, &spec, &handle);
+				if (result == D2RL::Items::Result::Success) {
+					break;
+				}
+			}
 			if (result == D2RL::Items::Result::Success) {
 				made++;
 			} else {
@@ -2238,11 +2245,11 @@ static void __cdecl SpawnOnGameThread(const D2RL::PluginContext* context, void* 
 			}
 		}
 		if (made > 0) {
-			Log("GrailTrackrr test: spawned %d item(s) at your feet", made);
+			Log("GrailTrackrr test: spawned %d item(s) into your inventory or stash", made);
 		}
 		if (made < static_cast<int>(job->items.size())) {
 			std::lock_guard guard(g.lock);
-			g.popups.push_back(Popup { "msg", "Some items could not be created", "See the D2RLoader log" });
+			g.popups.push_back(Popup { "msg", "Some items could not be created", "Make room in the inventory or stash (see the D2RLoader log)" });
 		}
 	} catch (...) {
 	}
