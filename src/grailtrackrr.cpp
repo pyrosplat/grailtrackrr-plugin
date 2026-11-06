@@ -44,7 +44,7 @@
 
 namespace fs = std::filesystem;
 
-static constexpr const char* PluginVersion = "0.8.1";
+static constexpr const char* PluginVersion = "0.8.2";
 
 static constexpr D2RL::PluginInfo GrailTrackrrInfo {
 	.infoSize    = D2RL::PluginInfoSize,
@@ -108,10 +108,11 @@ struct State {
 	std::unordered_map<std::wstring, fs::file_time_type> saveTimes;   // .d2s write times at load
 	uint64_t                     leftAtMs        = 0;
 	int32_t                      fieldAreaId     = -1;   // last area outside town, where a death happened
-	std::unordered_set<uint32_t> knownSeeds;
-	std::unordered_set<uint32_t> runewordSeeds;
+	// Items already seen this game, by ItemKey (not the bare seed: see ItemKey).
+	std::unordered_set<uint64_t> knownSeeds;
+	std::unordered_set<uint64_t> runewordSeeds;
 	// Socketed item count last checked for runeword status, by seed.
-	std::unordered_map<uint32_t, uint32_t> socketChecked;
+	std::unordered_map<uint64_t, uint32_t> socketChecked;
 	std::string                  charName;
 	bool                         hardcore     = false;
 	int32_t                      clvl         = 0;
@@ -131,7 +132,7 @@ struct State {
 	std::string                  itemsSignature;
 	bool                         itemsDirty      = false;
 	uint64_t                     lastItemsSentMs = 0;
-	std::unordered_set<uint32_t> statsSent;
+	std::unordered_set<uint64_t> statsSent;
 	// Presence: tells the site this character is playing right now.
 	bool                         presenceDirty   = false;
 	uint64_t                     nextHeartbeatMs = 0;
@@ -143,6 +144,21 @@ struct State {
 	uint32_t                     failures     = 0;
 	// Display.
 	std::deque<Popup>            popups;
+
+	// Test accounts: "grailtrackrr spawn ..." (see the Test mode section).
+	struct SpawnSpec {
+		std::string code;
+		std::string quality;
+		int32_t     row = -1;
+		bool        eth = false;
+		std::string name;
+	};
+	bool                   testMode = false;  // the server says this is a test account
+	std::string            spawnQuery;        // waiting to be looked up by the server
+	bool                   spawnLookup = false;
+	std::vector<SpawnSpec> spawnQueue;        // looked up, waiting to be created in game
+	// Spawned items not yet picked up: their finds are reported as "test". code|quality|row -> expiry.
+	std::unordered_map<std::string, uint64_t> spawnedPending;
 	std::string                  statusLine   = "GrailTrackrr: connecting";
 	std::string                  lastError;
 	bool                         pinging      = false;
@@ -490,6 +506,38 @@ static auto CodeString(uint32_t code) -> std::string {
 	return s;
 }
 
+// One item's identity within a game. Not the bare itemSeed: if the loader reports no seed
+// (0) or the same seed for several items, a new grail item would look already known and
+// its find would never be sent. Two items only share a key if seeds, base and quality match.
+// Without any seed, the runtime id (stable for the whole game) keeps items apart.
+static auto ItemKey(const D2RL::Items::ItemInfo& item) -> uint64_t {
+	uint64_t h = 1469598103934665603ULL;
+	const auto mix = [&h](uint64_t v) {
+		h ^= v;
+		h *= 1099511628211ULL;
+	};
+	const bool seeded = item.itemSeed != 0 || item.generationSeed != 0;
+	mix(item.itemSeed);
+	mix(item.generationSeed);
+	mix(item.code);
+	mix(static_cast<uint32_t>(item.quality));
+	mix(static_cast<uint32_t>(item.qualityRecordId));
+	if (!seeded) {
+		mix(0xFFFFFFFFULL + item.runtimeId);
+	}
+	return h;
+}
+
+// Identifies a spawned item until its find is reported (see the Test mode section).
+static auto SpawnSignature(const std::string& code, const std::string& quality, int32_t row) -> std::string {
+	return code + "|" + quality + "|" + std::to_string(quality == "unique" || quality == "set" ? row : -1);
+}
+
+// The seed the server stores for an item: itemSeed, else generationSeed, else none (0).
+static auto ReportSeed(const D2RL::Items::ItemInfo& item) -> uint32_t {
+	return item.itemSeed != 0 ? item.itemSeed : item.generationSeed;
+}
+
 static auto IsRuneCode(const std::string& code) -> bool {
 	return code.size() == 3 && code[0] == 'r' && std::isdigit(static_cast<unsigned char>(code[1])) && std::isdigit(static_cast<unsigned char>(code[2]));
 }
@@ -568,7 +616,9 @@ static void ItemStatsJson(std::string& out, const D2RL::Items::ItemInfo& item) {
 
 static void ItemJson(std::string& out, const D2RL::Items::ItemInfo& item, bool withName, int32_t runeword = -1) {
 	out += '{';
-	JsonInt(out, "seed", item.itemSeed);
+	if (ReportSeed(item) != 0) {
+		JsonInt(out, "seed", ReportSeed(item));
+	}
 	JsonStr(out, "code", CodeString(item.code));
 	JsonStr(out, "quality", QualityName(item.quality));
 	JsonInt(out, "row", item.qualityRecordId);
@@ -650,6 +700,8 @@ static void HandleReply(const std::string& body) {
 			} else {
 				g.statusLine = "GrailTrackrr: " + parts[2];
 			}
+		} else if (parts[0] == "TEST") {
+			g.testMode = parts.size() >= 2 && parts[1] == "1";
 		} else if (parts[0] == "POPUP" && parts.size() >= 4) {
 			g.popups.push_back(Popup { parts[1], parts[2], parts[3] });
 			if (g.popups.size() > 4) {
@@ -998,7 +1050,7 @@ static auto __cdecl CollectItem(const D2RL::PluginContext*, const D2RL::Items::I
 	return D2RL::Inventory::IterationAction::Continue;
 }
 
-static void SendBaseline(const std::vector<D2RL::Items::ItemInfo>& items, const std::unordered_map<uint32_t, int32_t>& runewords) {
+static void SendBaseline(const std::vector<D2RL::Items::ItemInfo>& items, const std::unordered_map<uint64_t, int32_t>& runewords) {
 	const auto saves = ScanSaves();
 	std::string name;
 	bool        hardcore = false;
@@ -1060,7 +1112,7 @@ static void SendBaseline(const std::vector<D2RL::Items::ItemInfo>& items, const 
 	JsonKey(ev, "items") += '[';
 	bool first = true;
 	for (const auto& item : items) {
-		const auto    rw  = runewords.find(item.itemSeed);
+		const auto    rw  = runewords.find(ItemKey(item));
 		const int32_t row = rw != runewords.end() ? rw->second : -1;
 		// The clean-start check needs every shared stash item; otherwise only grail candidates.
 		if (!IsCandidate(item) && row < 0 && item.container != D2RL::Items::ItemContainer::SharedStash) {
@@ -1105,7 +1157,19 @@ static void SendFind(const D2RL::Items::ItemInfo& item, int32_t runeword) {
 	// Where the item came from: Cube output lands in the Cube; anything that
 	// appears while a vendor or gamble window is open was bought.
 	std::string source = "drop";
-	if (runeword >= 0) {
+	{
+		// Spawned with the test command (and still waiting to be picked up).
+		std::lock_guard guard(g.lock);
+		const auto      it = g.spawnedPending.find(SpawnSignature(CodeString(item.code), QualityName(item.quality), item.qualityRecordId));
+		if (it != g.spawnedPending.end()) {
+			if (NowMs() < it->second) {
+				source = "test";
+			}
+			g.spawnedPending.erase(it);
+		}
+	}
+	if (source == "test") {
+	} else if (runeword >= 0) {
 		source = "runeword";
 	} else if (item.container == D2RL::Items::ItemContainer::Cube) {
 		source = "cube";
@@ -1138,7 +1202,7 @@ static void SendFind(const D2RL::Items::ItemInfo& item, int32_t runeword) {
 	ev += "}}";
 	QueueEvent(std::move(ev));
 	if (g.config.debug) {
-		Log("GrailTrackrr: new item %s seed=%u quality=%s row=%d runeword=%d ilvl=%u source=%s", CodeString(item.code).c_str(), item.itemSeed,
+		Log("GrailTrackrr: new item %s seed=%u quality=%s row=%d runeword=%d ilvl=%u source=%s", CodeString(item.code).c_str(), ReportSeed(item),
 			QualityName(item.quality), item.qualityRecordId, runeword, item.itemLevel, source.c_str());
 	}
 }
@@ -1231,7 +1295,7 @@ static auto EquippedSignature(const std::vector<D2RL::Items::ItemInfo>& items) -
 	std::string sig;
 	for (const auto& item : items) {
 		if (item.container == D2RL::Items::ItemContainer::Equipment) {
-			sig += std::to_string(item.itemSeed) + ':' + std::to_string(item.bodyLocation) + ':' + std::to_string(item.socketedItemCount) + ';';
+			sig += std::to_string(ItemKey(item)) + ':' + std::to_string(item.bodyLocation) + ':' + std::to_string(item.socketedItemCount) + ';';
 		}
 	}
 	return sig;
@@ -1246,7 +1310,7 @@ static auto CarriedSignature(const std::vector<D2RL::Items::ItemInfo>& items) ->
 	std::string sig;
 	for (const auto& item : items) {
 		if (IsCarried(item)) {
-			sig += std::to_string(item.itemSeed) + ':' + std::to_string(static_cast<uint32_t>(item.container)) + ':' + std::to_string(item.x) + ',' + std::to_string(item.y)
+			sig += std::to_string(ItemKey(item)) + ':' + std::to_string(static_cast<uint32_t>(item.container)) + ':' + std::to_string(item.x) + ',' + std::to_string(item.y)
 			     + ':' + std::to_string(item.socketedItemCount) + ':' + std::to_string(item.quantity) + ';';
 		}
 	}
@@ -1273,7 +1337,7 @@ static void SendItems(const std::vector<D2RL::Items::ItemInfo>& items) {
 	JsonInt(ev, "ts", static_cast<long long>(WallMs()));
 	JsonKey(ev, "items") += '[';
 	bool                  first = true;
-	std::vector<uint32_t> withStats;
+	std::vector<uint64_t> withStats;
 	for (const auto& item : items) {
 		if (!IsCarried(item)) {
 			continue;
@@ -1284,7 +1348,9 @@ static void SendItems(const std::vector<D2RL::Items::ItemInfo>& items) {
 		}
 		first = false;
 		ev += '{';
-		JsonInt(ev, "seed", item.itemSeed);
+		if (ReportSeed(item) != 0) {
+			JsonInt(ev, "seed", ReportSeed(item));
+		}
 		JsonStr(ev, "code", CodeString(item.code));
 		JsonStr(ev, "quality", QualityName(item.quality));
 		JsonInt(ev, "row", item.qualityRecordId);
@@ -1300,11 +1366,11 @@ static void SendItems(const std::vector<D2RL::Items::ItemInfo>& items) {
 		bool sent;
 		{
 			std::lock_guard guard(g.lock);
-			sent = g.statsSent.contains(item.itemSeed);
+			sent = g.statsSent.contains(ItemKey(item));
 		}
 		if (!sent && (IsCandidate(item) || rw >= 0)) {
 			ItemStatsJson(ev, item);
-			withStats.push_back(item.itemSeed);
+			withStats.push_back(ItemKey(item));
 		}
 		ev += '}';
 	}
@@ -1455,6 +1521,8 @@ static void WatchSaves() {
 	QueueEventLocked(std::move(ev));
 }
 
+static void StartQueuedSpawns(D2RL::PlayerHandle player);
+
 static void __cdecl ScanOnUiThread(const D2RL::PluginContext* context, void*) noexcept {
 	g.scanQueued = false;
 	try {
@@ -1478,6 +1546,7 @@ static void __cdecl ScanOnUiThread(const D2RL::PluginContext* context, void*) no
 		if (g.inventory->getLocalPlayer(context, &player) != D2RL::Inventory::Result::Success) {
 			return;
 		}
+		StartQueuedSpawns(player);
 		const D2RL::Inventory::ItemFilter filter {
 			.structSize    = sizeof(D2RL::Inventory::ItemFilter),
 			.containerMask = D2RL::Items::AllItemContainers,
@@ -1488,22 +1557,35 @@ static void __cdecl ScanOnUiThread(const D2RL::PluginContext* context, void*) no
 		}
 
 		if (baseline) {
-			std::unordered_map<uint32_t, int32_t> runewords;
+			std::unordered_map<uint64_t, int32_t> runewords;
 			for (const auto& item : scan.items) {
 				const int32_t row = RunewordRow(item);
 				if (row >= 0) {
-					runewords[item.itemSeed] = row;
+					runewords[ItemKey(item)] = row;
 				}
 			}
 			{
 				std::lock_guard guard(g.lock);
 				for (const auto& item : scan.items) {
-					g.knownSeeds.insert(item.itemSeed);
-					g.socketChecked[item.itemSeed] = item.socketedItemCount;
+					g.knownSeeds.insert(ItemKey(item));
+					g.socketChecked[ItemKey(item)] = item.socketedItemCount;
 				}
 				for (const auto& [seed, row] : runewords) {
 					g.runewordSeeds.insert(seed);
 				}
+			}
+			// Diagnostics: items the loader gave no seed or a shared seed (see ItemKey).
+			{
+				std::unordered_set<uint32_t> seeds;
+				size_t                       zero = 0, shared = 0;
+				for (const auto& item : scan.items) {
+					if (item.itemSeed == 0) {
+						zero++;
+					} else if (!seeds.insert(item.itemSeed).second) {
+						shared++;
+					}
+				}
+				Log("GrailTrackrr: load scan found %zu items (%zu without a seed, %zu sharing a seed).", scan.items.size(), zero, shared);
 			}
 			SendBaseline(scan.items, runewords);
 			{
@@ -1527,13 +1609,13 @@ static void __cdecl ScanOnUiThread(const D2RL::PluginContext* context, void*) no
 		{
 			std::lock_guard guard(g.lock);
 			for (const auto& item : scan.items) {
-				const bool isNew   = g.knownSeeds.insert(item.itemSeed).second;
-				auto&      checked = g.socketChecked[item.itemSeed];
+				const bool isNew   = g.knownSeeds.insert(ItemKey(item)).second;
+				auto&      checked = g.socketChecked[ItemKey(item)];
 				const bool sockets = item.socketCount > 0 && item.socketedItemCount == item.socketCount && (isNew || checked != item.socketedItemCount);
 				checked            = item.socketedItemCount;
 				if (isNew && IsCandidate(item)) {
 					fresh.push_back(item);
-				} else if (sockets && !g.runewordSeeds.contains(item.itemSeed)) {
+				} else if (sockets && !g.runewordSeeds.contains(ItemKey(item))) {
 					recheck.push_back(item);
 				}
 			}
@@ -1549,7 +1631,7 @@ static void __cdecl ScanOnUiThread(const D2RL::PluginContext* context, void*) no
 		if (!made.empty()) {
 			std::lock_guard guard(g.lock);
 			for (const auto& [item, row] : made) {
-				g.runewordSeeds.insert(item.itemSeed);
+				g.runewordSeeds.insert(ItemKey(item));
 			}
 		}
 		for (const auto& item : fresh) {
@@ -1584,6 +1666,9 @@ static void __cdecl ScanOnUiThread(const D2RL::PluginContext* context, void*) no
 			if (g.characterDirty && now >= g.lastCharSentMs + 5'000) {
 				g.characterDirty = false;
 				sendChar         = true;
+				// The site shows the inventory from the save when it is newer than the
+				// last live snapshot, so send a fresh one alongside.
+				g.itemsDirty = true;
 			}
 			// Inventory and belt: resend when anything moves, at most every 5 s.
 			const std::string carried = CarriedSignature(scan.items);
@@ -1854,7 +1939,7 @@ static void __cdecl OnFrame(const D2RL::PluginContext* context, const D2RL::Over
 			};
 			(void)g.overlay->drawRectangle(context, &border);
 
-			const std::string heading = "New grail item";
+			const std::string heading = p.category == "msg" ? "GrailTrackrr test" : "New grail item";
 			Text(frame, heading, left + (width - Measure(frame, heading, title)) / 2.0F, y + 10.0F, title, { 0.75F, 0.70F, 0.62F, fade });
 			color.alpha = fade;
 			Text(frame, p.name, left + (width - Measure(frame, p.name, big)) / 2.0F, y + 14.0F + title, big, color);
@@ -1972,6 +2057,8 @@ static void LoadOutbox() {
 // Worker thread: drives sending, the connection check and the scan timer on
 // its own, so nothing depends on the overlay being drawn.
 
+static void TrySpawnLookup();
+
 static std::thread       worker;
 static std::atomic<bool> workerStop { false };
 
@@ -1993,6 +2080,7 @@ static void WorkerLoop() {
 			}
 			TrySend();
 			TryPing();
+			TrySpawnLookup();
 			SaveOutbox();
 			if (now >= nextSaveWatchMs) {
 				nextSaveWatchMs = now + 5'000;
@@ -2005,11 +2093,205 @@ static void WorkerLoop() {
 }
 
 // ---------------------------------------------------------------------------
+// Test mode: "grailtrackrr spawn <what>" on a test account. The server turns what was
+// typed into items (worker thread), the local player is captured on the UI thread, and
+// the items are created at the player's feet on the game thread. Picking them up runs
+// the normal find path; those finds are reported with source "test".
+
+static void PushMessage(const std::string& text) {
+	std::lock_guard guard(g.lock);
+	g.popups.push_back(Popup { "msg", text, "" });
+	if (g.popups.size() > 4) {
+		g.popups.pop_front();
+	}
+}
+
+static auto UrlEncode(const std::string& s) -> std::string {
+	static const char* hex = "0123456789ABCDEF";
+	std::string        out;
+	for (const unsigned char c : s) {
+		if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+			out += static_cast<char>(c);
+		} else {
+			out += '%';
+			out += hex[c >> 4];
+			out += hex[c & 15];
+		}
+	}
+	return out;
+}
+
+static auto PackCode(const std::string& code) -> uint32_t {
+	uint32_t v = 0;
+	for (int i = 0; i < 4; ++i) {
+		const char c = i < static_cast<int>(code.size()) ? code[static_cast<size_t>(i)] : ' ';
+		v |= static_cast<uint32_t>(static_cast<unsigned char>(c)) << (8 * i);
+	}
+	return v;
+}
+
+static void OnSpawnReply(const HttpResult& r, void*) {
+	try {
+		std::vector<std::string> messages;
+		{
+			std::lock_guard guard(g.lock);
+			g.spawnLookup = false;
+		}
+		if (!r.reached) {
+			PushMessage("Spawn: cannot reach the server");
+			return;
+		}
+		size_t start = 0;
+		while (start < r.body.size()) {
+			size_t end = r.body.find('\n', start);
+			if (end == std::string::npos) {
+				end = r.body.size();
+			}
+			const std::string line = r.body.substr(start, end - start);
+			start                  = end + 1;
+			std::vector<std::string> parts;
+			size_t                   p = 0;
+			while (true) {
+				const size_t tab = line.find('\t', p);
+				parts.push_back(line.substr(p, tab == std::string::npos ? std::string::npos : tab - p));
+				if (tab == std::string::npos) {
+					break;
+				}
+				p = tab + 1;
+			}
+			if (parts[0] == "MSG" && parts.size() >= 2) {
+				messages.push_back(parts[1]);
+			} else if (parts[0] == "SPAWN" && parts.size() >= 6) {
+				std::lock_guard guard(g.lock);
+				g.spawnQueue.push_back({ parts[1], parts[2], std::atoi(parts[3].c_str()), parts[4] == "1", parts[5] });
+			}
+		}
+		for (const auto& m : messages) {
+			PushMessage(m);
+			Log("GrailTrackrr test: %s", m.c_str());
+		}
+	} catch (...) {
+	}
+}
+
+// Worker thread: look up a typed spawn command.
+static void TrySpawnLookup() {
+	std::string query;
+	{
+		std::lock_guard guard(g.lock);
+		if (g.spawnQuery.empty() || g.spawnLookup) {
+			return;
+		}
+		query        = g.spawnQuery;
+		g.spawnQuery.clear();
+		g.spawnLookup = true;
+	}
+	HttpSend(false, "/api/plugin/spawn?q=" + UrlEncode(query), {}, OnSpawnReply, nullptr);
+}
+
+struct SpawnJob {
+	D2RL::PlayerHandle                player;
+	std::vector<decltype(g.spawnQueue)::value_type> items;
+};
+
+static auto QualityFromName(const std::string& q) -> D2RL::Items::Quality {
+	if (q == "unique") return D2RL::Items::Quality::Unique;
+	if (q == "set") return D2RL::Items::Quality::Set;
+	return D2RL::Items::Quality::Normal;
+}
+
+// Game thread: create the items on the ground at the player's feet.
+static void __cdecl SpawnOnGameThread(const D2RL::PluginContext* context, void* user) noexcept {
+	auto* job = static_cast<SpawnJob*>(user);
+	try {
+		int made = 0;
+		for (const auto& s : job->items) {
+			D2RL::Items::ItemCreateSpec spec {};
+			spec.structSize      = D2RL::Items::ItemCreateSpecSize;
+			// Testing the same unique twice in one game is fine here.
+			spec.flags           = D2RL::Items::ItemCreateFlagBit(D2RL::Items::ItemCreateFlag::AllowDuplicateUnique);
+			spec.code            = PackCode(s.code);
+			spec.quality         = QualityFromName(s.quality);
+			spec.qualityRecordId = s.row >= 0 ? static_cast<uint32_t>(s.row) : D2RL::Items::RandomQualityRecord;
+			spec.itemLevel       = 90;
+			spec.seedMode        = D2RL::Items::SeedMode::Random;
+			spec.quantity        = D2RL::Items::DefaultValue;
+			spec.durability      = D2RL::Items::DefaultValue;
+			spec.socketCount     = 0;
+			spec.stateFlags      = D2RL::Items::ItemStateIdentified | (s.eth ? D2RL::Items::ItemStateEthereal : 0U);
+			spec.destination.structSize = D2RL::Items::ItemDestinationSize;
+			spec.destination.container  = D2RL::Items::ItemContainer::Ground;
+			spec.destination.placement  = D2RL::Items::Placement::Automatic;
+			D2RL::ItemHandle handle {};
+			{
+				// Marked before creating, so the scan that spots it reports it as a test find.
+				std::lock_guard guard(g.lock);
+				g.spawnedPending[SpawnSignature(s.code, s.quality, s.row)] = NowMs() + 30 * 60'000;
+			}
+			const auto result = g.items->createItem(context, job->player, &spec, &handle);
+			if (result == D2RL::Items::Result::Success) {
+				made++;
+			} else {
+				std::lock_guard guard(g.lock);
+				g.spawnedPending.erase(SpawnSignature(s.code, s.quality, s.row));
+				Log("GrailTrackrr test: could not create %s (code %s, result %u)", s.name.c_str(), s.code.c_str(), static_cast<uint32_t>(result));
+			}
+		}
+		if (made > 0) {
+			Log("GrailTrackrr test: spawned %d item(s) at your feet", made);
+		}
+		if (made < static_cast<int>(job->items.size())) {
+			std::lock_guard guard(g.lock);
+			g.popups.push_back(Popup { "msg", "Some items could not be created", "See the D2RLoader log" });
+		}
+	} catch (...) {
+	}
+	delete job;
+}
+
+// UI thread (from the scan): hand looked-up items to the game thread with the local player.
+static void StartQueuedSpawns(D2RL::PlayerHandle player) {
+	auto* job = new SpawnJob { player, {} };
+	{
+		std::lock_guard guard(g.lock);
+		job->items.swap(g.spawnQueue);
+	}
+	if (job->items.empty()) {
+		delete job;
+		return;
+	}
+	if (g.threads->runOnGameThread == nullptr || g.threads->runOnGameThread(g.ctx, SpawnOnGameThread, job) != D2RL::Threads::Result::Success) {
+		delete job;
+		PushMessage("Spawn: items can only be created in a single player game you host");
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Console
 
 static auto StatusCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext* command, void*) noexcept -> D2RL::ConsoleCommandResult {
 	if (command == nullptr || command->plugin == nullptr) {
 		return D2RL::ConsoleCommandResult::Failed;
+	}
+	// "grailtrackrr spawn <what>": test accounts only.
+	std::string args = command->args != nullptr ? std::string(command->args, command->argsLength) : std::string();
+	args.erase(0, args.find_first_not_of(" \t"));
+	if (args.rfind("spawn", 0) == 0) {
+		std::string what = args.substr(5);
+		what.erase(0, what.find_first_not_of(" \t"));
+		bool test = false, inGame = false;
+		{
+			std::lock_guard guard(g.lock);
+			test   = g.testMode;
+			inGame = g.inGame;
+			if (test && inGame) {
+				g.spawnQuery = what.empty() ? "help" : what;
+			}
+		}
+		command->plugin->WriteConsoleMessage(!test ? "GrailTrackrr: spawn only works on test accounts (an admin turns that on)."
+			: !inGame                             ? "GrailTrackrr: load a character first."
+			                                      : "GrailTrackrr: looking that up...");
+		return D2RL::ConsoleCommandResult::Handled;
 	}
 	char message[512] {};
 	{

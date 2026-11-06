@@ -43,6 +43,8 @@ Open an [issue](https://github.com/pyrosplat/grailtrackrr-plugin/issues). Includ
 ## Build it yourself
 Double-click `build.cmd` (it installs anything missing with winget and fetches the [D2RLoader PluginSDK](https://github.com/D2RLoader/PluginSDK)). The DLL lands in `dist\`. `.\build.ps1 -GameDir "<game folder>"` also installs it.
 
+Test accounts (set by a site admin) can spawn items to test with: `grailtrackrr spawn <item name | set name | random>` in the D2RLoader console.
+
 Releases are built by GitHub Actions from a version tag (`v0.7.1`, matching `PluginVersion` in `src/grailtrackrr.cpp`).
 
 ## License
