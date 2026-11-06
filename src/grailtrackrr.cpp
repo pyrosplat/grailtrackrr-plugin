@@ -44,7 +44,7 @@
 
 namespace fs = std::filesystem;
 
-static constexpr const char* PluginVersion = "0.7.0";
+static constexpr const char* PluginVersion = "0.8.0";
 
 static constexpr D2RL::PluginInfo GrailTrackrrInfo {
 	.infoSize    = D2RL::PluginInfoSize,
@@ -127,6 +127,11 @@ struct State {
 	bool                         characterDirty  = false;
 	uint64_t                     nextCharCheckMs = 0;
 	uint64_t                     lastCharSentMs  = 0;
+	// Inventory and belt view: what was last sent, and items whose stats were sent this game.
+	std::string                  itemsSignature;
+	bool                         itemsDirty      = false;
+	uint64_t                     lastItemsSentMs = 0;
+	std::unordered_set<uint32_t> statsSent;
 	// Presence: tells the site this character is playing right now.
 	bool                         presenceDirty   = false;
 	uint64_t                     nextHeartbeatMs = 0;
@@ -600,7 +605,7 @@ static void QueueEventLocked(std::string json) {
 		json.insert(1, "\"session\":" + std::to_string(g.session) + ",");
 	}
 	// Only the newest character snapshot and presence matter; drop older unsent ones.
-	for (const char* type : { "character", "presence" }) {
+	for (const char* type : { "character", "presence", "items" }) {
 		if (IsType(json, type)) {
 			const auto from = g.outbox.begin() + static_cast<std::ptrdiff_t>(std::min(g.inFlight, g.outbox.size()));
 			g.outbox.erase(std::remove_if(from, g.outbox.end(), [type](const std::string& e) { return IsType(e, type); }), g.outbox.end());
@@ -1232,6 +1237,86 @@ static auto EquippedSignature(const std::vector<D2RL::Items::ItemInfo>& items) -
 	return sig;
 }
 
+// Inventory and belt: what the character carries (charms in the inventory count toward stats).
+static auto IsCarried(const D2RL::Items::ItemInfo& item) -> bool {
+	return item.container == D2RL::Items::ItemContainer::Inventory || item.container == D2RL::Items::ItemContainer::Belt;
+}
+
+static auto CarriedSignature(const std::vector<D2RL::Items::ItemInfo>& items) -> std::string {
+	std::string sig;
+	for (const auto& item : items) {
+		if (IsCarried(item)) {
+			sig += std::to_string(item.itemSeed) + ':' + std::to_string(static_cast<uint32_t>(item.container)) + ':' + std::to_string(item.x) + ',' + std::to_string(item.y)
+			     + ':' + std::to_string(item.socketedItemCount) + ':' + std::to_string(item.quantity) + ';';
+		}
+	}
+	return sig;
+}
+
+// UI thread: where every carried item sits. Grail items (and runewords) also carry their
+// exact stats, once per game for each item; the server keeps them between snapshots.
+static void SendItems(const std::vector<D2RL::Items::ItemInfo>& items) {
+	std::string charName;
+	int32_t     clvl;
+	{
+		std::lock_guard guard(g.lock);
+		charName = g.charName;
+		clvl     = g.clvl;
+	}
+	if (charName.empty()) {
+		return;
+	}
+	std::string ev = "{";
+	JsonStr(ev, "type", "items");
+	JsonStr(ev, "charName", charName);
+	JsonInt(ev, "clvl", clvl);
+	JsonInt(ev, "ts", static_cast<long long>(WallMs()));
+	JsonKey(ev, "items") += '[';
+	bool                  first = true;
+	std::vector<uint32_t> withStats;
+	for (const auto& item : items) {
+		if (!IsCarried(item)) {
+			continue;
+		}
+		const int32_t rw = RunewordRow(item);
+		if (!first) {
+			ev += ',';
+		}
+		first = false;
+		ev += '{';
+		JsonInt(ev, "seed", item.itemSeed);
+		JsonStr(ev, "code", CodeString(item.code));
+		JsonStr(ev, "quality", QualityName(item.quality));
+		JsonInt(ev, "row", item.qualityRecordId);
+		if (rw >= 0) {
+			JsonInt(ev, "rw", rw);
+		}
+		JsonBool(ev, "eth", (item.stateFlags & D2RL::Items::ItemStateEthereal) != 0);
+		JsonStr(ev, "c", item.container == D2RL::Items::ItemContainer::Belt ? "belt" : "inventory");
+		JsonInt(ev, "x", item.x);
+		JsonInt(ev, "y", item.y);
+		JsonInt(ev, "sk", static_cast<int32_t>(item.socketCount));
+		JsonInt(ev, "qty", item.quantity);
+		bool sent;
+		{
+			std::lock_guard guard(g.lock);
+			sent = g.statsSent.contains(item.itemSeed);
+		}
+		if (!sent && (IsCandidate(item) || rw >= 0)) {
+			ItemStatsJson(ev, item);
+			withStats.push_back(item.itemSeed);
+		}
+		ev += '}';
+	}
+	ev += "]}";
+	QueueEvent(std::move(ev));
+	std::lock_guard guard(g.lock);
+	for (const auto seed : withStats) {
+		g.statsSent.insert(seed);
+	}
+	g.lastItemsSentMs = NowMs();
+}
+
 // UI thread: equipped items come from the live game, stats and skills from the save.
 static void SendCharacter(const std::vector<D2RL::Items::ItemInfo>& items) {
 	fs::path    path;
@@ -1426,6 +1511,12 @@ static void __cdecl ScanOnUiThread(const D2RL::PluginContext* context, void*) no
 				g.equippedSignature = EquippedSignature(scan.items);
 			}
 			SendCharacter(scan.items);
+			{
+				std::lock_guard guard(g.lock);
+				g.itemsSignature = CarriedSignature(scan.items);
+				g.itemsDirty     = false;
+			}
+			SendItems(scan.items);
 			QueuePresence(true);
 			return;
 		}
@@ -1472,6 +1563,7 @@ static void __cdecl ScanOnUiThread(const D2RL::PluginContext* context, void*) no
 		// (stats and skills only change on disk at save time). At most every 5 s.
 		const uint64_t now     = NowMs();
 		bool           sendChar = false;
+		bool           sendInv  = false;
 		bool           presence = false;
 		{
 			std::lock_guard guard(g.lock);
@@ -1493,10 +1585,23 @@ static void __cdecl ScanOnUiThread(const D2RL::PluginContext* context, void*) no
 				g.characterDirty = false;
 				sendChar         = true;
 			}
+			// Inventory and belt: resend when anything moves, at most every 5 s.
+			const std::string carried = CarriedSignature(scan.items);
+			if (carried != g.itemsSignature) {
+				g.itemsSignature = carried;
+				g.itemsDirty     = true;
+			}
+			if (g.itemsDirty && now >= g.lastItemsSentMs + 5'000) {
+				g.itemsDirty = false;
+				sendInv      = true;
+			}
 			presence = g.presenceDirty || now >= g.nextHeartbeatMs;
 		}
 		if (sendChar) {
 			SendCharacter(scan.items);
+		}
+		if (sendInv) {
+			SendItems(scan.items);
 		}
 		if (presence) {
 			QueuePresence(true);
@@ -1531,6 +1636,8 @@ static void __cdecl OnGameplayEvent(const D2RL::PluginContext*, const D2RL::Life
 				g.knownSeeds.clear();
 				g.runewordSeeds.clear();
 				g.socketChecked.clear();
+				g.statsSent.clear();
+				g.itemsSignature.clear();
 				g.clvl       = 0;
 				g.areaId     = -1;
 				g.fieldAreaId = -1;

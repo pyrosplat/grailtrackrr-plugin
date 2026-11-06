@@ -1,0 +1,20 @@
+# GrailTrackrr plugin settings.
+# D2RLoader copies this to d2rloader/config/grailtrackrr.toml the first time it runs.
+
+[grailtrackrr]
+# Your GrailTrackrr site. Must be https:// unless the server runs on this PC (http://localhost:8080).
+server_url = "https://grailtrackrr.com"
+# From the My grail page on the site. Keep it private.
+api_key = ""
+# Leave empty to use Saved Games\Diablo II Resurrected (or the active mod's save folder).
+save_folder = ""
+# In-game popup for each new grail item.
+popup_seconds = 6
+popup_position = "top"   # "top" or "center"
+# Small connection line in the bottom-left corner while in game.
+show_status = true
+# Logs every new item and UI panel message to the plugin log.
+debug = false
+# Sends the game's item text with finds and equipped gear. Leave off: it is not needed
+# (the site reads stats directly) and causes a "leaked Stats" assertion when you exit.
+item_text = false

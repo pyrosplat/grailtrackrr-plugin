@@ -1,3 +1,7 @@
 sdk/
 build/
 dist/
+
+# Local release helper (kept out of the public repo)
+release.ps1
+release.cmd
