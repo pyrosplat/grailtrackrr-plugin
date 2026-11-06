@@ -16,14 +16,11 @@ In game, the console command `grailtrackrr` shows the connection status.
 ## Settings (`grailtrackrr.toml`)
 | Key | Default | |
 | --- | --- | --- |
-| `server_url` | `https://grailtrackrr.com` | Use `http://localhost:8080` for a server on your own PC |
 | `api_key` | | From the My grail page. Keep it private |
-| `save_folder` | | Empty: `Saved Games\Diablo II Resurrected` (or the active mod's folder) |
-| `popup_seconds` | `6` | How long the in-game popup stays |
-| `popup_position` | `top` | `top` or `center` |
-| `show_status` | `true` | Small connection line in the bottom-left corner |
-| `debug` | `false` | Logs new items and UI messages to the D2RLoader log |
-| `item_text` | `false` | Leave off (asks the game for tooltips, which trips an assertion on exit) |
+| `popup_seconds` | `6` | How long the popup for a new grail item stays; `0` turns it off |
+| `show_status` | `true` | Connection line in the bottom-left corner |
+
+Self-hosting: add `server_url = "http://localhost:8080"` (or your own https address).
 
 ## What it sends
 Only to the `server_url` you set, signed with your API key:
@@ -44,6 +41,7 @@ Open an [issue](https://github.com/pyrosplat/grailtrackrr-plugin/issues). Includ
 Double-click `build.cmd` (it installs anything missing with winget and fetches the [D2RLoader PluginSDK](https://github.com/D2RLoader/PluginSDK)). The DLL lands in `dist\`. `.\build.ps1 -GameDir "<game folder>"` also installs it.
 
 Test accounts (set by a site admin) can spawn items to test with: `grailtrackrr spawn <item name | set name | random>` in the D2RLoader console.
+`grailtrackrr popup` shows a test popup.
 
 Releases are built by GitHub Actions from a version tag (`v0.7.1`, matching `PluginVersion` in `src/grailtrackrr.cpp`).
 

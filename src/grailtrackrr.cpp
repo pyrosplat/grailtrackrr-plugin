@@ -25,6 +25,7 @@
 #include <winhttp.h>
 
 #include <algorithm>
+#include <optional>
 #include <atomic>
 #include <cctype>
 #include <cstdarg>
@@ -44,7 +45,7 @@
 
 namespace fs = std::filesystem;
 
-static constexpr const char* PluginVersion = "0.8.3";
+static constexpr const char* PluginVersion = "1.0.0";
 
 static constexpr D2RL::PluginInfo GrailTrackrrInfo {
 	.infoSize    = D2RL::PluginInfoSize,
@@ -61,7 +62,7 @@ static constexpr D2RL::PluginInfo GrailTrackrrInfo {
 // State
 
 struct Config {
-	std::string serverUrl;
+	std::string serverUrl = "https://grailtrackrr.com";
 	std::string apiKey;
 	std::string saveFolder;
 	float       popupSeconds = 6.0F;
@@ -71,13 +72,21 @@ struct Config {
 	// Asks the game to build item tooltips. Off by default: building them outside
 	// the game's own hover leaks stat lists, which trips an assertion on exit.
 	bool        itemText     = false;
+	// Where the item check runs: the game thread sees the real items (with seeds), the UI
+	// thread only the display copies. "ui" is the old behaviour, kept as a fallback.
+	bool        scanOnGame   = true;
+	// Reads each item's own stat rolls (exact rolls on the site, runeword detection).
+	// A switch so it can be turned off while chasing the leaked-stats assertion on exit.
+	bool        itemStats    = true;
+	// Not in the default config: turns the item check off entirely, for troubleshooting.
+	bool        scanItems    = true;
 };
 
 struct Popup {
 	std::string category;
 	std::string name;
 	std::string detail;
-	double      shownAt = -1.0; // set on first draw
+	uint64_t    notBeforeMs = 0; // test popups wait until the console is closed
 };
 
 struct LastKill {
@@ -92,7 +101,8 @@ struct State {
 	const D2RL::ItemService*      items     = nullptr;
 	const D2RL::ThreadService*    threads   = nullptr;
 	const D2RL::HttpService*      http      = nullptr;
-	const D2RL::OverlayService*   overlay   = nullptr;
+	const D2RL::PanelService*     panels    = nullptr;   // optional: popups and status line
+	const D2RL::WidgetService*    widgets   = nullptr;
 
 	Config config;
 
@@ -178,6 +188,42 @@ static auto WallMs() noexcept -> uint64_t {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
+// Lines for the D2RLoader console. Log() only reaches the log file, so messages the player
+// should see are queued here and written from the UI thread (see FlushConsole).
+static std::mutex               consoleLock;
+static std::vector<std::string> consoleQueue;
+
+static void Say(const char* fmt, ...) noexcept {
+	char    buffer[512] {};
+	va_list args;
+	va_start(args, fmt);
+	std::vsnprintf(buffer, sizeof(buffer), fmt, args);
+	va_end(args);
+	try {
+		std::lock_guard guard(consoleLock);
+		if (consoleQueue.size() < 50) {
+			consoleQueue.emplace_back(buffer);
+		}
+	} catch (...) {
+	}
+	if (g.ctx != nullptr) {
+		g.ctx->LogInfo(buffer);
+	}
+}
+
+static void FlushConsole(const D2RL::PluginContext* context) noexcept {
+	std::vector<std::string> lines;
+	try {
+		std::lock_guard guard(consoleLock);
+		lines.swap(consoleQueue);
+	} catch (...) {
+		return;
+	}
+	for (const auto& line : lines) {
+		context->WriteConsoleMessage(line.c_str());
+	}
+}
+
 static void Log(const char* fmt, ...) noexcept {
 	char    buffer[1024] {};
 	va_list args;
@@ -211,6 +257,12 @@ static auto Unquote(std::string s) -> std::string {
 	return Trim(hash == std::string::npos ? s : s.substr(0, hash));
 }
 
+// true/false, also on/off, yes/no and 1/0.
+static auto IsOn(std::string value) -> bool {
+	std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	return value == "true" || value == "on" || value == "yes" || value == "1";
+}
+
 static void ParseConfig(const std::string& text) {
 	bool        inTable = false;
 	size_t      start   = 0;
@@ -238,7 +290,7 @@ static void ParseConfig(const std::string& text) {
 		const std::string key   = Trim(line.substr(0, eq));
 		const std::string value = Unquote(line.substr(eq + 1));
 		if (key == "server_url") {
-			g.config.serverUrl = value;
+			g.config.serverUrl = value.empty() ? "https://grailtrackrr.com" : value;
 			while (!g.config.serverUrl.empty() && g.config.serverUrl.back() == '/') {
 				g.config.serverUrl.pop_back();
 			}
@@ -247,15 +299,23 @@ static void ParseConfig(const std::string& text) {
 		} else if (key == "save_folder") {
 			g.config.saveFolder = value;
 		} else if (key == "popup_seconds") {
-			g.config.popupSeconds = std::clamp(static_cast<float>(std::atof(value.c_str())), 1.0F, 30.0F);
+			// 0 turns the popup off.
+			const float seconds = static_cast<float>(std::atof(value.c_str()));
+			g.config.popupSeconds = seconds <= 0.0F ? 0.0F : std::clamp(seconds, 1.0F, 30.0F);
 		} else if (key == "popup_position") {
 			g.config.popupCenter = value == "center";
 		} else if (key == "show_status") {
-			g.config.showStatus = value == "true";
+			g.config.showStatus = IsOn(value);
 		} else if (key == "debug") {
-			g.config.debug = value == "true";
+			g.config.debug = IsOn(value);
+		} else if (key == "scan_thread") {
+			g.config.scanOnGame = value != "ui";
 		} else if (key == "item_text") {
-			g.config.itemText = value == "true";
+			g.config.itemText = IsOn(value);
+		} else if (key == "item_stats") {
+			g.config.itemStats = IsOn(value);
+		} else if (key == "scan_items") {
+			g.config.scanItems = IsOn(value);
 		}
 	}
 }
@@ -554,7 +614,7 @@ static auto RunewordRow(const D2RL::Items::ItemInfo& item) -> int32_t {
 	if ((item.quality != Q::Normal && item.quality != Q::Superior) || item.socketCount == 0 || item.socketedItemCount != item.socketCount) {
 		return -1;
 	}
-	if (!D2RL::HasItemServiceField(g.items, D2RL::ItemServiceDetailsFieldEnd) || g.items->getItemDetails == nullptr) {
+	if (!g.config.itemStats || !D2RL::HasItemServiceField(g.items, D2RL::ItemServiceDetailsFieldEnd) || g.items->getItemDetails == nullptr) {
 		return -1;
 	}
 	D2RL::Items::ItemDetails     details { .structSize = D2RL::Items::ItemDetailsSize };
@@ -595,7 +655,7 @@ static auto ItemName(D2RL::ItemHandle handle) -> std::string {
 // The item's own magic stats as [statId, layer, value] so the site can show exact rolls.
 // UI thread only. Optional: older loaders without getItemDetails simply send none.
 static void ItemStatsJson(std::string& out, const D2RL::Items::ItemInfo& item) {
-	if (!D2RL::HasItemServiceField(g.items, D2RL::ItemServiceDetailsFieldEnd) || g.items->getItemDetails == nullptr) {
+	if (!g.config.itemStats || !D2RL::HasItemServiceField(g.items, D2RL::ItemServiceDetailsFieldEnd) || g.items->getItemDetails == nullptr) {
 		return;
 	}
 	D2RL::Items::ItemDetails   details { .structSize = D2RL::Items::ItemDetailsSize };
@@ -1521,10 +1581,18 @@ static void WatchSaves() {
 	QueueEventLocked(std::move(ev));
 }
 
-static void StartQueuedSpawns(D2RL::PlayerHandle player);
+static void StartQueuedSpawns();
 
+static void __cdecl FlushConsoleOnUi(const D2RL::PluginContext* context, void*) noexcept {
+	FlushConsole(context);
+}
+
+// Runs on the game thread by default (scan_thread in the config), else the UI thread.
 static void __cdecl ScanOnUiThread(const D2RL::PluginContext* context, void*) noexcept {
 	g.scanQueued = false;
+	if (!g.config.scanItems) {
+		return;
+	}
 	try {
 		bool baseline = false;
 		{
@@ -1546,7 +1614,7 @@ static void __cdecl ScanOnUiThread(const D2RL::PluginContext* context, void*) no
 		if (g.inventory->getLocalPlayer(context, &player) != D2RL::Inventory::Result::Success) {
 			return;
 		}
-		StartQueuedSpawns(player);
+		StartQueuedSpawns();
 		const D2RL::Inventory::ItemFilter filter {
 			.structSize    = sizeof(D2RL::Inventory::ItemFilter),
 			.containerMask = D2RL::Items::AllItemContainers,
@@ -1840,113 +1908,436 @@ static auto __cdecl OnUiMessage(const D2RL::PluginContext*, const D2RL::SharedEv
 }
 
 // ---------------------------------------------------------------------------
-// Drawing (render thread). Also drives the scan and send timers.
+// In-game display: two small native D2R panels drawn by the game's own UI.
+//   grailtrackrr/Status  one line at the bottom left (show_status)
+//   grailtrackrr/Popup   "New grail item" card, one find at a time (popup_seconds)
+// D2RLoader 1.3.1 can show and hide widgets but not change their text, so every text
+// the panels can show is a label in the layout: one per status, popup heading and
+// percentage digit. Opening a panel shows all of its widgets, so after each open every
+// label but the wanted ones is hidden again. The loader stops finding widgets after a
+// few hundred lookups, so the item name is not shown in the popup (it goes to the
+// console); a loader that can change widget text would allow it.
+// Layout text does not take D2 color codes (ÿc4); colors come from each label's style. The layouts are registered from memory at load; every
+// panel and widget call runs on the UI thread (UiTick, queued by the worker).
 
-static auto CategoryColor(const std::string& cat) -> D2RL::Overlay::Color {
-	if (cat == "unique") return { 0.79F, 0.71F, 0.48F, 1.0F };
-	if (cat == "set")    return { 0.31F, 0.78F, 0.36F, 1.0F };
-	if (cat == "rune")   return { 0.94F, 0.64F, 0.23F, 1.0F };
-	if (cat == "eth")    return { 0.67F, 0.71F, 0.75F, 1.0F };
-	if (cat == "runeword") return { 0.56F, 0.61F, 1.0F, 1.0F };
-	return { 0.92F, 0.88F, 0.80F, 1.0F };
+static constexpr const char* StatusPanelId = "Status";
+static constexpr const char* PopupPanelId  = "Popup";
+static constexpr const char* StatusPanel   = "grailtrackrr/Status";
+static constexpr const char* PopupPanel    = "grailtrackrr/Popup";
+
+// Accent bars and headings, by popup category.
+struct PopupKind {
+	const char* cat;
+	const char* heading;
+	const char* color;
+};
+static constexpr PopupKind PopupKinds[] {
+	{ "unique",   "New grail unique",     "[0.78, 0.70, 0.47, 1.0]" },
+	{ "set",      "New grail set item",   "[0.31, 0.78, 0.36, 1.0]" },
+	{ "rune",     "New grail rune",       "[0.94, 0.64, 0.23, 1.0]" },
+	{ "runeword", "New grail runeword",   "[0.78, 0.70, 0.47, 1.0]" },
+	{ "eth",      "New ethereal find",    "[0.67, 0.71, 0.75, 1.0]" },
+	{ "sync",     "Offline finds synced", "[0.60, 0.56, 0.48, 1.0]" },
+	{ "msg",      "GrailTrackrr",         "[0.60, 0.56, 0.48, 1.0]" },
+};
+
+// Status line states. The text comes from the status line the connection code sets.
+struct StatusKind {
+	const char* id;
+	const char* text;
+};
+static constexpr StatusKind StatusKinds[] {
+	{ "connected", "GrailTrackrr: connected" },
+	{ "notstarted", "GrailTrackrr: grail not started, see My grail on the site" },
+	{ "offline", "GrailTrackrr: offline, finds are saved and sent later" },
+	{ "badkey", "GrailTrackrr: API key rejected, copy it again from My grail" },
+	{ "nokey", "GrailTrackrr: set api_key in grailtrackrr.toml" },
+	{ "error", "GrailTrackrr: problem, type grailtrackrr in the console" },
+};
+
+static auto StatusKindFor(const std::string& line) -> const char* {
+	if (line.rfind("GrailTrackrr connected", 0) == 0) return "connected";
+	if (line.rfind("GrailTrackrr not started", 0) == 0) return "notstarted";
+	if (line.find("cannot reach") != std::string::npos) return "offline";
+	if (line.find("API key rejected") != std::string::npos) return "badkey";
+	if (line.find("set api_key") != std::string::npos) return "nokey";
+	return "error";
 }
 
-static auto Measure(const D2RL::Overlay::Frame* frame, const std::string& text, float size) -> float {
-	const D2RL::Overlay::MeasureTextRequest request {
-		.structSize = D2RL::Overlay::MeasureTextRequestSize,
-		.canvas     = frame->canvas,
-		.textSize   = size,
-		.text       = text.c_str(),
-		.textLength = static_cast<uint32_t>(std::min<size_t>(text.size(), D2RL::Overlay::MaxTextBytes)),
-	};
-	D2RL::Overlay::TextMetrics metrics { .structSize = D2RL::Overlay::TextMetricsSize };
-	if (g.overlay->measureText(g.ctx, &request, &metrics) != D2RL::Overlay::Result::Success) {
-		return static_cast<float>(text.size()) * size * 0.5F;
+// Text color. Inline colors render black, so every label uses the game's white; the
+// accent bars carry the item's color.
+static constexpr const char* White = "\"$FontColorWhite\"";
+static constexpr const char* Grey  = White;
+static auto NameColor(const char*) -> const char* {
+	return White;
+}
+
+static auto JsonString(const std::string& s) -> std::string {
+	std::string out = "\"";
+	for (const char ch : s) {
+		if (ch == '"' || ch == '\\') {
+			out += '\\';
+		}
+		out += ch;
 	}
-	return metrics.width;
+	return out + '"';
 }
 
-static void Text(const D2RL::Overlay::Frame* frame, const std::string& text, float x, float y, float size, D2RL::Overlay::Color color) {
-	const D2RL::Overlay::TextRequest request {
-		.structSize = D2RL::Overlay::TextRequestSize,
-		.canvas     = frame->canvas,
-		.position   = { x, y },
-		.color      = color,
-		.textSize   = size,
-		.text       = text.c_str(),
-		.textLength = static_cast<uint32_t>(std::min<size_t>(text.size(), D2RL::Overlay::MaxTextBytes)),
+static auto TextStyle(const char* face, const char* size, const char* align, const char* color) -> std::string {
+	return std::string(R"({"fontFace":")") + face + R"(","fontColor":)" + color + R"(,"pointSize":")" + size + R"(","alignment":{"h":")" + align
+		+ R"(","v":"center"},"dropShadow":"$DefaultDropShadow"})";
+}
+
+static auto Label(const std::string& name, int x, int y, int w, int h, const std::string& text, const std::string& style) -> std::string {
+	return R"({"type":"TextBoxWidget","name":)" + JsonString(name) + R"(,"fields":{"rect":{"x":)" + std::to_string(x) + R"(,"y":)" + std::to_string(y)
+		+ R"(,"width":)" + std::to_string(w) + R"(,"height":)" + std::to_string(h) + R"(},"text":)" + JsonString(text) + R"(,"visible":false,"style":)" + style + "}}";
+}
+
+static auto StatusLayout() -> std::string {
+	// Anchored to the bottom left corner; the labels sit just above the screen edge.
+	std::string json = R"({"type":"Panel","name":"grailtrackrr/Status","fields":{"anchor":{"x":0.0,"y":1.0},"priority":8400},"children":[)";
+	const auto style = TextStyle("BlizzardGlobal", "$MediumFontSize", "left", White);
+	bool first = true;
+	for (const auto& k : StatusKinds) {
+		json += (first ? "" : ",") + Label(std::string("Status_") + k.id, 28, -66, 1500, 52, k.text, style);
+		first = false;
+	}
+	return json + "]}";
+}
+
+// Width of one digit and of "% of your grail found" in layout units, at $MediumFontSize.
+static constexpr int PctDigit = 20, PctRest = 340;
+
+// 100% only needs "1 0 0", so the three-digit set has one label per position.
+static auto PctDigitLabel(int len, int pos, int digit) -> std::string {
+	return "Pct" + std::to_string(len) + "_" + std::to_string(pos) + "_" + std::to_string(len == 3 ? (pos == 0 ? 1 : 0) : digit);
+}
+
+static auto PopupLayout(bool center) -> std::string {
+	// Flat: findWidget only looks at a panel's direct children. The card's widgets are
+	// placed relative to the anchor (top or middle of the screen, centred).
+	constexpr int Width = 720, Height = 112, X = -Width / 2;
+	const int Y = center ? -200 : 140;
+	auto rect = [&](int x, int y, int w, int h) {
+		return R"({"x":)" + std::to_string(X + x) + R"(,"y":)" + std::to_string(Y + y) + R"(,"width":)" + std::to_string(w) + R"(,"height":)" + std::to_string(h) + "}";
 	};
-	(void)g.overlay->drawText(g.ctx, &request);
+	std::string json = std::string(R"({"type":"Panel","name":"grailtrackrr/Popup","fields":{"anchor":{"x":0.5,"y":)") + (center ? "0.5" : "0.0")
+		+ R"(},"priority":8500},"children":[)";
+	json += R"({"type":"RectangleWidget","name":"Back","fields":{"rect":)" + rect(0, 0, Width, Height) + R"(,"color":[0.05, 0.04, 0.03, 0.88]}})";
+	const auto headStyle  = TextStyle("Exocet", "$MediumFontSize", "center", White);
+	const auto digitStyle = TextStyle("BlizzardGlobal", "$MediumFontSize", "center", White);
+	const auto restStyle  = TextStyle("BlizzardGlobal", "$MediumFontSize", "left", White);
+	auto label = [&](const std::string& name, int x, int y, int w, int h, const std::string& text, const std::string& style) {
+		return R"(,{"type":"TextBoxWidget","name":)" + JsonString(name) + R"(,"fields":{"rect":)" + rect(x, y, w, h) + R"(,"text":)" + JsonString(text)
+			+ R"(,"style":)" + style + "}}";
+	};
+	for (const auto& k : PopupKinds) {
+		for (const auto& [edge, y] : { std::pair<const char*, int> { "Top", 0 }, std::pair<const char*, int> { "Bottom", Height - 3 } }) {
+			json += std::string(R"(,{"type":"RectangleWidget","name":"Accent)") + edge + "_" + k.cat + R"(","fields":{"rect":)" + rect(0, y, Width, 3)
+				+ R"(,"color":)" + k.color + "}}";
+		}
+		json += label(std::string("Heading_") + k.cat, 16, 10, Width - 32, 50, k.heading, headStyle);
+	}
+	// "NN% of your grail found", centred: for each length (1, 2 or 3 digits) one label per
+	// digit and position, then the rest of the line placed after them.
+	for (int len = 1; len <= 3; ++len) {
+		const int start = (Width - len * PctDigit - PctRest) / 2;
+		for (int pos = 0; pos < len; ++pos) {
+			for (int d = (len == 3 ? (pos == 0 ? 1 : 0) : 0); d <= (len == 3 ? (pos == 0 ? 1 : 0) : 9); ++d) {
+				json += label(PctDigitLabel(len, pos, d), start + pos * PctDigit, 60, PctDigit, 40, std::to_string(d), digitStyle);
+			}
+		}
+		json += label("PctText" + std::to_string(len), start + len * PctDigit, 60, PctRest + 40, 40, "% of your grail found", restStyle);
+	}
+	return json + "]}";
 }
 
-static void __cdecl OnFrame(const D2RL::PluginContext* context, const D2RL::Overlay::Frame* frame, void*) noexcept {
-	try {
-		const uint64_t now = NowMs();
+struct PanelUi {
+	// Layout bytes stay alive for the plugin's lifetime (D2RLoader copies them anyway).
+	std::string                      statusJson;
+	std::string                      popupJson;
+	D2RL::Panels::RegistrationHandle status = D2RL::Panels::InvalidHandle;
+	D2RL::Panels::RegistrationHandle popup  = D2RL::Panels::InvalidHandle;
+	bool                             ready  = false;
+	std::vector<std::string>         statusLabels;  // every label that is shown or hidden
+	std::vector<std::string>         popupLabels;
+	std::unordered_map<std::string, D2RL::Widgets::WidgetHandle> handles;   // "panel/label"
+	// UI thread only from here.
+	std::string                      statusShown;   // status label now visible
+	bool                             statusOpen = false;
+	bool                             popupOpen  = false;
+	uint64_t                         popupUntil = 0;
+	bool                             popupShowing = false;   // a find is on screen
+	int                              popupHidePasses = 0;    // full hide passes left after an open
+	int                              statusApply = 0;
+	std::vector<std::string>         popupShown;    // popup labels now visible
+	std::atomic<bool>                tickQueued { false };
+	std::atomic<uint32_t>            lastError { 0 };   // last failing call, for the status command
+	std::string                      lastErrorWhat;
+};
+static PanelUi ui;
 
-		if (frame == nullptr || frame->structSize < D2RL::Overlay::FrameRequiredSize) {
+static std::string panelSetup = "not started";   // why the panels are off, for the status command
+
+// Plugin load. Without the panel services the plugin still tracks; it just shows nothing in game.
+static void SetUpPanels(const D2RL::PluginContext* context) {
+	const D2RL::ResourceService* resources = nullptr;
+	auto fail = [&](const std::string& why) {
+		g.panels   = nullptr;
+		g.widgets  = nullptr;
+		panelSetup = why;
+		Log("GrailTrackrr: in-game panels are off: %s", why.c_str());
+	};
+	const auto rq = context->QueryService(&resources);
+	if (rq != D2RL::ServiceQueryResult::Success || resources == nullptr) {
+		return fail("resource service query " + std::to_string(static_cast<int>(rq)));
+	}
+	if (!D2RL::HasResourceServiceField(resources, D2RL::ResourceServiceRequiredSize)) {
+		return fail("resource service version " + std::to_string(resources->serviceVersion) + " size " + std::to_string(resources->serviceSize));
+	}
+	const auto pq = context->QueryService(&g.panels);
+	if (pq != D2RL::ServiceQueryResult::Success || g.panels == nullptr) {
+		return fail("panel service query " + std::to_string(static_cast<int>(pq)));
+	}
+	if (!D2RL::HasPanelServiceField(g.panels, D2RL::PanelServiceGetPanelInfoFieldEnd) || g.panels->openPanel == nullptr || g.panels->closePanel == nullptr) {
+		return fail("panel service version " + std::to_string(g.panels->serviceVersion) + " size " + std::to_string(g.panels->serviceSize));
+	}
+	const auto wq = context->QueryService(&g.widgets);
+	if (wq != D2RL::ServiceQueryResult::Success || g.widgets == nullptr) {
+		return fail("widget service query " + std::to_string(static_cast<int>(wq)));
+	}
+	// Only findPanel, findWidget and setWidgetVisible are used, which every version has.
+	if (!D2RL::HasWidgetServiceField(g.widgets, D2RL::WidgetServiceRequiredSize)) {
+		return fail("widget service version " + std::to_string(g.widgets->serviceVersion) + " size " + std::to_string(g.widgets->serviceSize));
+	}
+	ui.popupLabels.push_back("Back");
+	for (int len = 1; len <= 3; ++len) {
+		for (int pos = 0; pos < len; ++pos) {
+			for (int d = 0; d <= (len == 3 ? 0 : 9); ++d) {
+				ui.popupLabels.push_back(PctDigitLabel(len, pos, d));
+			}
+		}
+		ui.popupLabels.push_back("PctText" + std::to_string(len));
+	}
+	for (const auto& k : PopupKinds) {
+		for (const char* prefix : { "AccentTop_", "AccentBottom_", "Heading_" }) {
+			ui.popupLabels.push_back(prefix + std::string(k.cat));
+		}
+	}
+	for (const auto& k : StatusKinds) {
+		ui.statusLabels.push_back(std::string("Status_") + k.id);
+	}
+	ui.statusJson = StatusLayout();
+	ui.popupJson  = PopupLayout(g.config.popupCenter);
+	for (const auto& [path, json] : { std::pair<const char*, const std::string*> { "data/global/ui/layouts/grailtrackrr/Statushd.json", &ui.statusJson },
+	                                  std::pair<const char*, const std::string*> { "data/global/ui/layouts/grailtrackrr/Popuphd.json", &ui.popupJson } }) {
+		const D2RL::Resources::ResourceRegistration resource {
+			.structSize = D2RL::Resources::ResourceRegistrationSize,
+			.path       = path,
+			.bytes      = json->data(),
+			.byteCount  = json->size(),
+		};
+		D2RL::Resources::RegistrationHandle handle = D2RL::Resources::InvalidHandle;
+		const auto r = resources->registerResource(context, &resource, &handle);
+		if (r != D2RL::Resources::Result::Success) {
+			return fail(std::string("registering ") + path + " returned " + std::to_string(static_cast<uint32_t>(r)));
+		}
+	}
+	for (auto [id, handle] : { std::pair<const char*, D2RL::Panels::RegistrationHandle*> { StatusPanelId, &ui.status },
+	                           std::pair<const char*, D2RL::Panels::RegistrationHandle*> { PopupPanelId, &ui.popup } }) {
+		const D2RL::Panels::PanelRegistration reg { .structSize = D2RL::Panels::PanelRegistrationSize, .flags = D2RL::Panels::PanelFlags::None, .localId = id };
+		const auto r = g.panels->registerPanel(context, &reg, handle);
+		if (r != D2RL::Panels::Result::Success) {
+			return fail(std::string("registering panel ") + id + " returned " + std::to_string(static_cast<uint32_t>(r)));
+		}
+	}
+	panelSetup = "ok";
+	ui.ready   = true;
+}
+
+static void NoteUiError(const std::string& what, uint32_t code) {
+	if (code != 0 && (ui.lastError != code || ui.lastErrorWhat != what)) {
+		ui.lastError     = code;
+		ui.lastErrorWhat = what;
+		Log("GrailTrackrr: %s failed (D2RLoader result %u).", what.c_str(), code);
+	}
+}
+
+static auto PanelOpen(const D2RL::PluginContext* context, D2RL::Panels::RegistrationHandle handle) -> bool {
+	D2RL::Panels::PanelInfo info { .structSize = D2RL::Panels::PanelInfoSize };
+	return g.panels->getPanelInfo(context, handle, &info) == D2RL::Panels::Result::Success && info.presentationState == D2RL::Panels::PresentationState::Open;
+}
+
+// Widget handles survive closing and reopening a panel, so each is looked up once.
+static auto Widget(const D2RL::PluginContext* context, const char* panel, const std::string& name) -> D2RL::Widgets::WidgetHandle {
+	const std::string key = std::string(panel) + "/" + name;
+	if (const auto it = ui.handles.find(key); it != ui.handles.end()) {
+		return it->second;
+	}
+	D2RL::Widgets::WidgetHandle root = D2RL::Widgets::InvalidHandle, child = D2RL::Widgets::InvalidHandle;
+	auto r = g.widgets->findPanel(context, panel, &root);
+	if (r == D2RL::Widgets::Result::Success) {
+		r = g.widgets->findWidget(context, root, name.c_str(), &child);
+	}
+	if (r != D2RL::Widgets::Result::Success) {
+		NoteUiError("finding " + name + " after " + std::to_string(ui.handles.size()) + " widgets", static_cast<uint32_t>(r));
+		return D2RL::Widgets::InvalidHandle;
+	}
+	ui.handles.emplace(key, child);
+	return child;
+}
+
+// Shows the wanted labels of a just-opened panel and hides the rest.
+static void ShowOnly(const D2RL::PluginContext* context, const char* panel, const std::vector<std::string>& labels, const std::vector<std::string>& wanted) {
+	for (const auto& name : labels) {
+		const auto w = Widget(context, panel, name);
+		if (w != D2RL::Widgets::InvalidHandle) {
+			const bool show = std::find(wanted.begin(), wanted.end(), name) != wanted.end();
+			NoteUiError("showing " + name, static_cast<uint32_t>(g.widgets->setWidgetVisible(context, w, show)));
+		}
+	}
+}
+
+// Sets which popup widgets are visible, touching only the ones that change.
+static void SetPopupShown(const D2RL::PluginContext* context, std::vector<std::string> shown) {
+	for (const auto& name : ui.popupShown) {
+		if (std::find(shown.begin(), shown.end(), name) == shown.end()) {
+			const auto w = Widget(context, PopupPanel, name);
+			if (w != D2RL::Widgets::InvalidHandle) {
+				NoteUiError("hiding " + name, static_cast<uint32_t>(g.widgets->setWidgetVisible(context, w, false)));
+			}
+		}
+	}
+	for (const auto& name : shown) {
+		if (std::find(ui.popupShown.begin(), ui.popupShown.end(), name) == ui.popupShown.end()) {
+			const auto w = Widget(context, PopupPanel, name);
+			if (w != D2RL::Widgets::InvalidHandle) {
+				NoteUiError("showing " + name, static_cast<uint32_t>(g.widgets->setWidgetVisible(context, w, true)));
+			}
+		}
+	}
+	ui.popupShown = std::move(shown);
+}
+
+static void ShowPopup(const D2RL::PluginContext* context, const Popup& p) {
+	// "Name (Ethereal)" is the ethereal copy of a catalog item.
+	std::string name = p.name;
+	bool        eth  = p.category == "eth";
+	if (constexpr std::string_view suffix = " (Ethereal)"; name.size() > suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) {
+		name.resize(name.size() - suffix.size());
+		eth = true;
+	}
+	const bool known = std::any_of(std::begin(PopupKinds), std::end(PopupKinds), [&](const PopupKind& k) { return p.category == k.cat; });
+	const std::string kind = eth ? "eth" : known ? p.category : "msg";
+	std::vector<std::string> shown { "Back", "AccentTop_" + kind, "AccentBottom_" + kind, "Heading_" + kind };
+	// The name and progress go to the console (the popup cannot show changing text).
+	Say("GrailTrackrr: %s%s%s", name.c_str(), eth ? " (Ethereal)" : "", p.detail.empty() ? "" : (" - " + p.detail).c_str());
+	// Progress: "123 / 403 found, 30.5%". Whole percent, rounded down (100 only when complete).
+	if (const auto pctAt = p.detail.rfind('%'); pctAt != std::string::npos) {
+		size_t start = pctAt;
+		while (start > 0 && (std::isdigit(static_cast<unsigned char>(p.detail[start - 1])) || p.detail[start - 1] == '.')) {
+			--start;
+		}
+		if (start < pctAt) {
+			const int pct = std::clamp(static_cast<int>(std::atof(p.detail.substr(start, pctAt - start).c_str())), 0, 100);
+			const std::string digits = std::to_string(pct);
+			const int len = static_cast<int>(digits.size());
+			for (int pos = 0; pos < len; ++pos) {
+				shown.push_back(PctDigitLabel(len, pos, digits[static_cast<size_t>(pos)] - '0'));
+			}
+			shown.push_back("PctText" + std::to_string(len));
+		}
+	}
+	SetPopupShown(context, std::move(shown));
+	ui.popupShowing = true;
+	ui.popupUntil   = NowMs() + static_cast<uint64_t>(g.config.popupSeconds * 1000.0F);
+}
+
+// UI thread, about four times a second while in game and until the panels are closed after.
+static void __cdecl UiTick(const D2RL::PluginContext* context, void*) noexcept {
+	ui.tickQueued = false;
+	try {
+		if (!ui.ready) {
 			return;
 		}
-		const float base  = frame->defaultTextSize > 0 ? frame->defaultTextSize : 16.0F;
-		const double secs = static_cast<double>(now) / 1000.0;
-
-		std::vector<Popup> showing;
-		std::string        status;
+		const uint64_t now = NowMs();
+		bool           inGame = false;
+		std::string    status;
+		std::optional<Popup> next;
 		{
 			std::lock_guard guard(g.lock);
-			while (!g.popups.empty() && g.popups.front().shownAt >= 0 && secs - g.popups.front().shownAt > g.config.popupSeconds) {
+			inGame = g.inGame;
+			status = g.statusLine;
+			if (g.config.popupSeconds <= 0.0F) {
+				g.popups.clear();
+			} else if (inGame && ui.popupOpen && ui.popupHidePasses == 0 && !ui.popupShowing && !g.popups.empty() && now >= g.popups.front().notBeforeMs) {
+				next = g.popups.front();
 				g.popups.pop_front();
 			}
-			for (auto& p : g.popups) {
-				if (p.shownAt < 0) {
-					p.shownAt = secs;
-				}
+		}
+
+		// Status line: open while in game, reopened if the game closed it (loading screens).
+		if (inGame && g.config.showStatus) {
+			if (!PanelOpen(context, ui.status)) {
+				const auto opened = g.panels->openPanel(context, ui.status);
+				NoteUiError("opening the status line", static_cast<uint32_t>(opened));
+				ui.statusOpen  = opened == D2RL::Panels::Result::Success;
+				ui.statusShown.clear();
 			}
-			showing.assign(g.popups.begin(), g.popups.end());
-			status = g.statusLine;
+			const std::string kind = std::string("Status_") + StatusKindFor(status);
+			if (ui.statusOpen && kind != ui.statusShown) {
+				ui.statusShown = kind;
+				ui.statusApply = 2;
+			}
+			if (ui.statusOpen && ui.statusApply > 0) {
+				--ui.statusApply;
+				ShowOnly(context, StatusPanel, ui.statusLabels, { ui.statusShown });
+			}
+		} else if (ui.statusOpen || PanelOpen(context, ui.status)) {
+			NoteUiError("closing the status line", static_cast<uint32_t>(g.panels->closePanel(context, ui.status)));
+			ui.statusOpen = false;
 		}
 
-		if (g.config.showStatus) {
-			Text(frame, status, 12.0F, frame->screenHeight - base * 1.6F, base * 0.8F, { 0.85F, 0.80F, 0.70F, 0.75F });
-		}
-
-		float y = g.config.popupCenter ? frame->screenHeight * 0.30F : frame->screenHeight * 0.08F;
-		for (const auto& p : showing) {
-			const float age   = static_cast<float>(secs - p.shownAt);
-			const float fade  = std::clamp(std::min(age / 0.25F, (g.config.popupSeconds - age) / 0.6F), 0.0F, 1.0F);
-			const float title = base * 0.85F;
-			const float big   = base * 1.6F;
-			const float detailSize = base * 0.85F;
-			const float width = std::max({ Measure(frame, p.name, big), Measure(frame, p.detail, detailSize), 220.0F }) + 48.0F;
-			const float height = title + big + detailSize + 36.0F;
-			const float left  = (frame->screenWidth - width) / 2.0F;
-			auto        color = CategoryColor(p.category);
-
-			const D2RL::Overlay::FilledRectangleRequest bg {
-				.structSize = D2RL::Overlay::FilledRectangleRequestSize,
-				.canvas     = frame->canvas,
-				.rect       = { left, y, left + width, y + height },
-				.color      = { 0.09F, 0.07F, 0.06F, 0.90F * fade },
-				.rounding   = 6.0F,
-			};
-			(void)g.overlay->drawFilledRectangle(context, &bg);
-			const D2RL::Overlay::RectangleRequest border {
-				.structSize = D2RL::Overlay::RectangleRequestSize,
-				.canvas     = frame->canvas,
-				.rect       = { left, y, left + width, y + height },
-				.color      = { color.red, color.green, color.blue, 0.8F * fade },
-				.rounding   = 6.0F,
-				.thickness  = 1.5F,
-			};
-			(void)g.overlay->drawRectangle(context, &border);
-
-			const std::string heading = p.category == "msg" ? "GrailTrackrr test" : "New grail item";
-			Text(frame, heading, left + (width - Measure(frame, heading, title)) / 2.0F, y + 10.0F, title, { 0.75F, 0.70F, 0.62F, fade });
-			color.alpha = fade;
-			Text(frame, p.name, left + (width - Measure(frame, p.name, big)) / 2.0F, y + 14.0F + title, big, color);
-			Text(frame, p.detail, left + (width - Measure(frame, p.detail, detailSize)) / 2.0F, y + 20.0F + title + big, detailSize, { 0.85F, 0.80F, 0.70F, fade });
-			y += height + 10.0F;
+		// Popup: the panel stays open (empty) while in game, so its widgets keep the
+		// visibility set here and a popup only flips a handful of them. Opening it shows
+		// every widget, so everything is hidden once after each open (twice, in case the
+		// game finishes showing the panel a frame later).
+		if (inGame) {
+			if (!ui.popupOpen || !PanelOpen(context, ui.popup)) {
+				const auto opened = g.panels->openPanel(context, ui.popup);
+				NoteUiError("opening the popup", static_cast<uint32_t>(opened));
+				ui.popupOpen       = opened == D2RL::Panels::Result::Success;
+				ui.popupShowing    = false;
+				ui.popupHidePasses = ui.popupOpen ? 2 : 0;
+			}
+			if (ui.popupOpen && ui.popupHidePasses > 0) {
+				--ui.popupHidePasses;
+				ShowOnly(context, PopupPanel, ui.popupLabels, {});
+				ui.popupShown.clear();
+			} else if (ui.popupShowing && now >= ui.popupUntil) {
+				SetPopupShown(context, {});
+				ui.popupShowing = false;
+			}
+			if (next) {
+				ShowPopup(context, *next);
+			}
+		} else if (ui.popupOpen || PanelOpen(context, ui.popup)) {
+			NoteUiError("closing the popup", static_cast<uint32_t>(g.panels->closePanel(context, ui.popup)));
+			ui.popupOpen    = false;
+			ui.popupShowing = false;
+			ui.popupShown.clear();
 		}
 	} catch (...) {
+	}
+}
+
+// Worker thread.
+// Runs out of game too, so panels left open by a failed close still get closed.
+static void QueueUiTick() {
+	if (ui.ready && !ui.tickQueued.exchange(true)) {
+		if (g.threads->runOnUiThread(g.ctx, UiTick, nullptr) != D2RL::Threads::Result::Success) {
+			ui.tickQueued = false;
+		}
 	}
 }
 
@@ -2055,7 +2446,7 @@ static void LoadOutbox() {
 
 // ---------------------------------------------------------------------------
 // Worker thread: drives sending, the connection check and the scan timer on
-// its own, so nothing depends on the overlay being drawn.
+// its own, so nothing depends on the game drawing frames.
 
 static void TrySpawnLookup();
 
@@ -2074,10 +2465,23 @@ static void WorkerLoop() {
 			}
 			if (inGame && now >= g.nextScanMs && !g.scanQueued.exchange(true)) {
 				g.nextScanMs = now + 1'000;
-				if (g.threads->runOnUiThread(g.ctx, ScanOnUiThread, nullptr) != D2RL::Threads::Result::Success) {
+				const auto queued = g.config.scanOnGame && g.threads->runOnGameThread != nullptr ? g.threads->runOnGameThread(g.ctx, ScanOnUiThread, nullptr)
+				                                                                                : g.threads->runOnUiThread(g.ctx, ScanOnUiThread, nullptr);
+				if (queued != D2RL::Threads::Result::Success) {
 					g.scanQueued = false;
 				}
 			}
+			{
+				bool pending = false;
+				{
+					std::lock_guard guard(consoleLock);
+					pending = !consoleQueue.empty();
+				}
+				if (pending) {
+					(void)g.threads->runOnUiThread(g.ctx, FlushConsoleOnUi, nullptr);
+				}
+			}
+			QueueUiTick();
 			TrySend();
 			TryPing();
 			TrySpawnLookup();
@@ -2097,14 +2501,6 @@ static void WorkerLoop() {
 // typed into items (worker thread), the local player is captured on the UI thread, and
 // the items are created at the player's feet on the game thread. Picking them up runs
 // the normal find path; those finds are reported with source "test".
-
-static void PushMessage(const std::string& text) {
-	std::lock_guard guard(g.lock);
-	g.popups.push_back(Popup { "msg", text, "" });
-	if (g.popups.size() > 4) {
-		g.popups.pop_front();
-	}
-}
 
 static auto UrlEncode(const std::string& s) -> std::string {
 	static const char* hex = "0123456789ABCDEF";
@@ -2137,10 +2533,12 @@ static void OnSpawnReply(const HttpResult& r, void*) {
 			std::lock_guard guard(g.lock);
 			g.spawnLookup = false;
 		}
+		// Spawn messages go to the console only; the popup is for grail finds.
 		if (!r.reached) {
-			PushMessage("Spawn: cannot reach the server");
+			Say("GrailTrackrr test: cannot reach the server (%s)", r.error.c_str());
 			return;
 		}
+		int spawns = 0;
 		size_t start = 0;
 		while (start < r.body.size()) {
 			size_t end = r.body.find('\n', start);
@@ -2164,11 +2562,16 @@ static void OnSpawnReply(const HttpResult& r, void*) {
 			} else if (parts[0] == "SPAWN" && parts.size() >= 6) {
 				std::lock_guard guard(g.lock);
 				g.spawnQueue.push_back({ parts[1], parts[2], std::atoi(parts[3].c_str()), parts[4] == "1", parts[5] });
+				spawns++;
 			}
 		}
+		if (messages.empty() && spawns == 0) {
+			// Not a spawn reply at all: an older site without the spawn lookup, or an error page.
+			const std::string first = r.body.substr(0, std::min<size_t>(r.body.find('\n'), 100));
+			Say("GrailTrackrr test: unexpected reply from the server (HTTP %u): %s", r.status, first.c_str());
+		}
 		for (const auto& m : messages) {
-			PushMessage(m);
-			Log("GrailTrackrr test: %s", m.c_str());
+			Say("GrailTrackrr test: %s", m.c_str());
 		}
 	} catch (...) {
 	}
@@ -2186,11 +2589,11 @@ static void TrySpawnLookup() {
 		g.spawnQuery.clear();
 		g.spawnLookup = true;
 	}
+	Say("GrailTrackrr test: asking the server for \"%s\"", query.c_str());
 	HttpSend(false, "/api/plugin/spawn?q=" + UrlEncode(query), {}, OnSpawnReply, nullptr);
 }
 
 struct SpawnJob {
-	D2RL::PlayerHandle                player;
 	std::vector<decltype(g.spawnQueue)::value_type> items;
 };
 
@@ -2200,17 +2603,39 @@ static auto QualityFromName(const std::string& q) -> D2RL::Items::Quality {
 	return D2RL::Items::Quality::Normal;
 }
 
+static auto ItemResultName(D2RL::Items::Result r) -> const char* {
+	using R = D2RL::Items::Result;
+	switch (r) {
+	case R::InvalidArgument: return "invalid request";
+	case R::Unsupported: return "not supported here";
+	case R::Unavailable: return "no room, or not available";
+	case R::Conflict: return "conflict";
+	case R::NotFound: return "not found";
+	case R::Busy: return "busy";
+	case R::NotAuthoritative: return "not allowed in this game (single player you host only)";
+	case R::PolicyRejected: return "rejected by a page policy";
+	default: return "error";
+	}
+}
+
 // Game thread: create the items in the inventory, else the personal stash, else the Cube.
 // Not on the ground: dropping there trips a game assertion (BC_ASSERT hRoom) in some places.
 static void __cdecl SpawnOnGameThread(const D2RL::PluginContext* context, void* user) noexcept {
 	auto* job = static_cast<SpawnJob*>(user);
 	try {
+		// The authoritative player, looked up here on the game thread (as the SDK's item sample does).
+		D2RL::PlayerHandle player = D2RL::InvalidPlayerHandle;
+		if (g.inventory->getLocalPlayer(context, &player) != D2RL::Inventory::Result::Success) {
+			Say("GrailTrackrr test: could not find your character on the game thread");
+			delete job;
+			return;
+		}
 		int made = 0;
 		for (const auto& s : job->items) {
 			D2RL::Items::ItemCreateSpec spec {};
 			spec.structSize      = D2RL::Items::ItemCreateSpecSize;
 			// Testing the same unique twice in one game is fine here.
-			spec.flags           = D2RL::Items::ItemCreateFlagBit(D2RL::Items::ItemCreateFlag::AllowDuplicateUnique);
+			spec.flags           = s.quality == "unique" ? D2RL::Items::ItemCreateFlagBit(D2RL::Items::ItemCreateFlag::AllowDuplicateUnique) : 0U;
 			spec.code            = PackCode(s.code);
 			spec.quality         = QualityFromName(s.quality);
 			spec.qualityRecordId = s.row >= 0 ? static_cast<uint32_t>(s.row) : D2RL::Items::RandomQualityRecord;
@@ -2231,7 +2656,7 @@ static void __cdecl SpawnOnGameThread(const D2RL::PluginContext* context, void* 
 			auto result = D2RL::Items::Result::Unavailable;
 			for (const auto container : { D2RL::Items::ItemContainer::Inventory, D2RL::Items::ItemContainer::PersonalStash, D2RL::Items::ItemContainer::Cube }) {
 				spec.destination.container = container;
-				result                     = g.items->createItem(context, job->player, &spec, &handle);
+				result                     = g.items->createItem(context, player, &spec, &handle);
 				if (result == D2RL::Items::Result::Success) {
 					break;
 				}
@@ -2241,15 +2666,14 @@ static void __cdecl SpawnOnGameThread(const D2RL::PluginContext* context, void* 
 			} else {
 				std::lock_guard guard(g.lock);
 				g.spawnedPending.erase(SpawnSignature(s.code, s.quality, s.row));
-				Log("GrailTrackrr test: could not create %s (code %s, result %u)", s.name.c_str(), s.code.c_str(), static_cast<uint32_t>(result));
+				Say("GrailTrackrr test: could not create %s (code %s): %s", s.name.c_str(), s.code.c_str(), ItemResultName(result));
 			}
 		}
 		if (made > 0) {
-			Log("GrailTrackrr test: spawned %d item(s) into your inventory or stash", made);
+			Say("GrailTrackrr test: spawned %d item(s) into your inventory or stash", made);
 		}
 		if (made < static_cast<int>(job->items.size())) {
-			std::lock_guard guard(g.lock);
-			g.popups.push_back(Popup { "msg", "Some items could not be created", "Make room in the inventory or stash (see the D2RLoader log)" });
+			Say("GrailTrackrr test: some items could not be created; make room in the inventory or stash (see the D2RLoader log)");
 		}
 	} catch (...) {
 	}
@@ -2257,8 +2681,8 @@ static void __cdecl SpawnOnGameThread(const D2RL::PluginContext* context, void* 
 }
 
 // UI thread (from the scan): hand looked-up items to the game thread with the local player.
-static void StartQueuedSpawns(D2RL::PlayerHandle player) {
-	auto* job = new SpawnJob { player, {} };
+static void StartQueuedSpawns() {
+	auto* job = new SpawnJob {};
 	{
 		std::lock_guard guard(g.lock);
 		job->items.swap(g.spawnQueue);
@@ -2267,9 +2691,10 @@ static void StartQueuedSpawns(D2RL::PlayerHandle player) {
 		delete job;
 		return;
 	}
+	Say("GrailTrackrr test: creating %zu item(s)", job->items.size());
 	if (g.threads->runOnGameThread == nullptr || g.threads->runOnGameThread(g.ctx, SpawnOnGameThread, job) != D2RL::Threads::Result::Success) {
 		delete job;
-		PushMessage("Spawn: items can only be created in a single player game you host");
+		Say("GrailTrackrr test: items can only be created in a single player game you host");
 	}
 }
 
@@ -2283,6 +2708,15 @@ static auto StatusCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext*
 	// "grailtrackrr spawn <what>": test accounts only.
 	std::string args = command->args != nullptr ? std::string(command->args, command->argsLength) : std::string();
 	args.erase(0, args.find_first_not_of(" \t"));
+	if (args.rfind("popup", 0) == 0) {
+		{
+			std::lock_guard guard(g.lock);
+			// Shown 3 seconds from now, so there is time to close the console.
+			g.popups.push_back(Popup { "unique", "Test popup", "If you can read this, popups work", NowMs() + 3'000 });
+		}
+		command->plugin->WriteConsoleMessage(ui.ready ? "GrailTrackrr: close the console; a test popup shows in 3 seconds." : ("GrailTrackrr: the in-game panels are off: " + panelSetup).c_str());
+		return D2RL::ConsoleCommandResult::Handled;
+	}
 	if (args.rfind("spawn", 0) == 0) {
 		std::string what = args.substr(5);
 		what.erase(0, what.find_first_not_of(" \t"));
@@ -2300,11 +2734,15 @@ static auto StatusCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext*
 			                                      : "GrailTrackrr: looking that up...");
 		return D2RL::ConsoleCommandResult::Handled;
 	}
-	char message[512] {};
+	char message[1024] {};
 	{
 		std::lock_guard guard(g.lock);
-		std::snprintf(message, sizeof(message), "%s | server=%s api_key=%s | character=%s level=%d area=%d difficulty=%d | queued events=%zu", g.statusLine.c_str(),
-			g.config.serverUrl.c_str(), g.config.apiKey.empty() ? "missing" : "set", g.charName.c_str(), g.clvl, g.areaId, g.difficulty, g.outbox.size());
+		const uint32_t err = ui.lastError.load();
+		std::snprintf(message, sizeof(message),
+			"GrailTrackrr %s | %s | server=%s api_key=%s | character=%s level=%d | queued events=%zu | panels=%s%s%s%s show_status=%s | test_account=%s scan_items=%s scan_thread=%s item_stats=%s item_text=%s",
+			PluginVersion, g.statusLine.c_str(), g.config.serverUrl.c_str(), g.config.apiKey.empty() ? "missing" : "set", g.charName.c_str(), g.clvl, g.outbox.size(),
+			ui.ready ? "on" : ("off: " + panelSetup).c_str(), err != 0 ? " (last error: " : "", err != 0 ? (ui.lastErrorWhat + " " + std::to_string(err)).c_str() : "", err != 0 ? ")" : "",
+			g.config.showStatus ? "on" : "off", g.testMode ? "yes" : "no", g.config.scanItems ? "on" : "off", g.config.scanOnGame ? "game" : "ui", g.config.itemStats ? "on" : "off", g.config.itemText ? "on" : "off");
 	}
 	command->plugin->WriteConsoleMessage(message);
 	return D2RL::ConsoleCommandResult::Handled;
@@ -2358,11 +2796,8 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 			context->LogError("GrailTrackrr did not load: update D2RLoader to a version with plugin ABI 4 (HTTP support).");
 			return false;
 		}
-		// Optional: without the overlay there are no popups or status line, but tracking still works.
-		if (!Query(context, &g.overlay) || !D2RL::HasOverlayServiceField(g.overlay, D2RL::OverlayServiceRequiredSize)) {
-			g.overlay = nullptr;
-			context->LogWarn("GrailTrackrr: overlay service unavailable; in-game popups are off.");
-		}
+		// Optional: without panels there are no popups or status line, but tracking still works.
+		SetUpPanels(context);
 
 		static constexpr D2RL::Lifecycle::GameplayEventKind Kinds[] {
 			D2RL::Lifecycle::GameplayEventKind::GameJoined,
@@ -2410,23 +2845,11 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 			(void)shared->registerUiMessageListener(context, &listener, &handle);
 		}
 
-		const D2RL::Overlay::CallbackRegistration draw {
-			.structSize = D2RL::Overlay::CallbackRegistrationSize,
-			.phase      = D2RL::Overlay::Phase::AfterGameUi,
-			.priority   = 0,
-			.callback   = OnFrame,
-		};
-		D2RL::Overlay::CallbackHandle drawHandle = D2RL::Overlay::InvalidCallbackHandle;
-		if (g.overlay != nullptr && g.overlay->registerFrameCallback(context, &draw, &drawHandle) != D2RL::Overlay::Result::Success) {
-			g.overlay = nullptr;
-			context->LogWarn("GrailTrackrr: could not register the overlay; in-game popups are off.");
-		}
-
 		(void)context->RegisterConsoleCommand("grailtrackrr", StatusCommand, "Show GrailTrackrr connection and tracking status.");
 
 		const std::string configPath = context->pluginConfigPath != nullptr ? ToUtf8(fs::path(context->pluginConfigPath)) : "grailtrackrr.toml";
 		if (g.config.serverUrl.empty() || g.config.apiKey.empty()) {
-			g.statusLine = "GrailTrackrr: set server_url and api_key in " + configPath;
+			g.statusLine = "GrailTrackrr: set api_key in " + configPath;
 		} else if (g.config.serverUrl.rfind("http://", 0) == 0 && g.config.serverUrl.find("localhost") == std::string::npos && g.config.serverUrl.find("127.0.0.1") == std::string::npos) {
 			context->LogWarn("GrailTrackrr: server_url uses plain http; your API key is sent unencrypted. Use https:// outside your home network.");
 		}
