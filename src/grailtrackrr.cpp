@@ -44,7 +44,7 @@
 
 namespace fs = std::filesystem;
 
-static constexpr const char* PluginVersion = "0.8.0";
+static constexpr const char* PluginVersion = "0.8.1";
 
 static constexpr D2RL::PluginInfo GrailTrackrrInfo {
 	.infoSize    = D2RL::PluginInfoSize,

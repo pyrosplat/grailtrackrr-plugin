@@ -5,8 +5,8 @@ D2RLoader plugin for Diablo II: Resurrected (offline) that sends your Holy Grail
 Created by PyroSplat. Not affiliated with Blizzard Entertainment.
 
 ## Install
-1. Install [D2RLoader](https://github.com/D2RLoader) and check the game starts with it.
-2. Download `grailtrackrr-plugin-<version>.zip` from [Releases](https://github.com/pyrosplat/grailtrackrr-plugin/releases/latest) and copy `d2rl-grailtrackrr.dll` into `<game folder>\d2rloader\plugins`. Each release lists the file's SHA-256 so you can check your download.
+1. Install [D2RLoader](https://d2rloader.net/download.html) and check the game starts with it.
+2. Get GrailTrackrr from the [D2RLoader plugin hub](https://d2rloader.net/hub/plugins/grailtrackrr-live-grail-sharing) (or [Releases](https://github.com/pyrosplat/grailtrackrr-plugin/releases/latest) here) and copy `d2rl-grailtrackrr.dll` into `<game folder>\d2rloader\plugins`. Each GitHub release lists the file's SHA-256 so you can check your download.
 3. Start the game once. D2RLoader creates `<game folder>\d2rloader\config\grailtrackrr.toml`.
 4. Sign up at grailtrackrr.com, open **My grail**, copy your API key and paste it as `api_key` in that file.
 5. Start a grail on the site, then load a new level 1 character with an empty shared stash. The grail starts on its own.
