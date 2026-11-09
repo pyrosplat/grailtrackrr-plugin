@@ -45,7 +45,7 @@
 
 namespace fs = std::filesystem;
 
-static constexpr const char* PluginVersion = "1.0.1";
+static constexpr const char* PluginVersion = "1.0.3";
 
 static constexpr D2RL::PluginInfo GrailTrackrrInfo {
 	.infoSize    = D2RL::PluginInfoSize,
@@ -1913,7 +1913,7 @@ static auto __cdecl OnUiMessage(const D2RL::PluginContext*, const D2RL::SharedEv
 // whenever it refreshes a panel. So every piece of text is its own tiny panel with fixed
 // text, and showing something means opening its panel; nothing is ever hidden inside a
 // panel. A popup is a card panel (background, colour bar, heading) plus panels for the
-// percentage digits and the rest of the line. That is 47 panels, under the loader's 64.
+// percentage digits and the rest of the line. That is 50 panels, under the loader's 64.
 // When a loader with setText ships, this can shrink to one panel with the item's name.
 // Every panel call runs on the UI thread (UiTick, queued by the worker).
 
@@ -1930,6 +1930,7 @@ static constexpr PopupKind PopupKinds[] {
 	{ "runeword", "New grail runeword",   "[0.78, 0.70, 0.47, 1.0]" },
 	{ "eth",      "New ethereal find",    "[0.67, 0.71, 0.75, 1.0]" },
 	{ "sync",     "Offline finds synced", "[0.60, 0.56, 0.48, 1.0]" },
+	{ "badge",    "Badge earned!",        "[0.64, 0.45, 0.90, 1.0]" },
 	{ "msg",      "GrailTrackrr",         "[0.60, 0.56, 0.48, 1.0]" },
 };
 
@@ -2140,6 +2141,10 @@ static auto PopupPanels(const Popup& p) -> std::vector<std::string> {
 	const bool known = std::any_of(std::begin(PopupKinds), std::end(PopupKinds), [&](const PopupKind& k) { return p.category == k.cat; });
 	std::vector<std::string> shown { std::string("Card_") + (eth ? "eth" : known ? p.category : "msg") };
 	// The name and progress go to the console (the card cannot show changing text).
+	if (p.category == "badge") {
+		Say("GrailTrackrr: badge earned: %s%s", name.c_str(), p.detail.empty() ? "" : (" (" + p.detail + ")").c_str());
+		return shown;   // a badge's detail is its description, not progress
+	}
 	Say("GrailTrackrr: %s%s%s", name.c_str(), eth ? " (Ethereal)" : "", p.detail.empty() ? "" : (" - " + p.detail).c_str());
 	// Progress: "123 / 403 found, 30.5%". Whole percent, rounded down (100 only when complete).
 	if (const auto pctAt = p.detail.rfind('%'); pctAt != std::string::npos) {
