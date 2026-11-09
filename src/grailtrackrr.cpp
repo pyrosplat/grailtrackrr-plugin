@@ -45,7 +45,7 @@
 
 namespace fs = std::filesystem;
 
-static constexpr const char* PluginVersion = "1.0.0";
+static constexpr const char* PluginVersion = "1.0.1";
 
 static constexpr D2RL::PluginInfo GrailTrackrrInfo {
 	.infoSize    = D2RL::PluginInfoSize,
@@ -102,7 +102,6 @@ struct State {
 	const D2RL::ThreadService*    threads   = nullptr;
 	const D2RL::HttpService*      http      = nullptr;
 	const D2RL::PanelService*     panels    = nullptr;   // optional: popups and status line
-	const D2RL::WidgetService*    widgets   = nullptr;
 
 	Config config;
 
@@ -1908,24 +1907,17 @@ static auto __cdecl OnUiMessage(const D2RL::PluginContext*, const D2RL::SharedEv
 }
 
 // ---------------------------------------------------------------------------
-// In-game display: two small native D2R panels drawn by the game's own UI.
-//   grailtrackrr/Status  one line at the bottom left (show_status)
-//   grailtrackrr/Popup   "New grail item" card, one find at a time (popup_seconds)
-// D2RLoader 1.3.1 can show and hide widgets but not change their text, so every text
-// the panels can show is a label in the layout: one per status, popup heading and
-// percentage digit. Opening a panel shows all of its widgets, so after each open every
-// label but the wanted ones is hidden again. The loader stops finding widgets after a
-// few hundred lookups, so the item name is not shown in the popup (it goes to the
-// console); a loader that can change widget text would allow it.
-// Layout text does not take D2 color codes (ÿc4); colors come from each label's style. The layouts are registered from memory at load; every
-// panel and widget call runs on the UI thread (UiTick, queued by the worker).
+// In-game display, drawn by the game's own UI as small native D2R panels.
+//   Status line (bottom left, show_status) and the "New grail item" card (popup_seconds).
+// D2RLoader 1.3.1 cannot change a widget's text, and the game re-shows hidden widgets
+// whenever it refreshes a panel. So every piece of text is its own tiny panel with fixed
+// text, and showing something means opening its panel; nothing is ever hidden inside a
+// panel. A popup is a card panel (background, colour bar, heading) plus panels for the
+// percentage digits and the rest of the line. That is 47 panels, under the loader's 64.
+// When a loader with setText ships, this can shrink to one panel with the item's name.
+// Every panel call runs on the UI thread (UiTick, queued by the worker).
 
-static constexpr const char* StatusPanelId = "Status";
-static constexpr const char* PopupPanelId  = "Popup";
-static constexpr const char* StatusPanel   = "grailtrackrr/Status";
-static constexpr const char* PopupPanel    = "grailtrackrr/Popup";
-
-// Accent bars and headings, by popup category.
+// Card kinds: heading and colour bar.
 struct PopupKind {
 	const char* cat;
 	const char* heading;
@@ -1941,18 +1933,18 @@ static constexpr PopupKind PopupKinds[] {
 	{ "msg",      "GrailTrackrr",         "[0.60, 0.56, 0.48, 1.0]" },
 };
 
-// Status line states. The text comes from the status line the connection code sets.
+// Status line states. The state comes from the status line the connection code sets.
 struct StatusKind {
 	const char* id;
 	const char* text;
 };
 static constexpr StatusKind StatusKinds[] {
-	{ "connected", "GrailTrackrr: connected" },
+	{ "connected",  "GrailTrackrr: connected" },
 	{ "notstarted", "GrailTrackrr: grail not started, see My grail on the site" },
-	{ "offline", "GrailTrackrr: offline, finds are saved and sent later" },
-	{ "badkey", "GrailTrackrr: API key rejected, copy it again from My grail" },
-	{ "nokey", "GrailTrackrr: set api_key in grailtrackrr.toml" },
-	{ "error", "GrailTrackrr: problem, type grailtrackrr in the console" },
+	{ "offline",    "GrailTrackrr: offline, finds are saved and sent later" },
+	{ "badkey",     "GrailTrackrr: API key rejected, copy it again from My grail" },
+	{ "nokey",      "GrailTrackrr: set api_key in grailtrackrr.toml" },
+	{ "error",      "GrailTrackrr: problem, type grailtrackrr in the console" },
 };
 
 static auto StatusKindFor(const std::string& line) -> const char* {
@@ -1962,14 +1954,6 @@ static auto StatusKindFor(const std::string& line) -> const char* {
 	if (line.find("API key rejected") != std::string::npos) return "badkey";
 	if (line.find("set api_key") != std::string::npos) return "nokey";
 	return "error";
-}
-
-// Text color. Inline colors render black, so every label uses the game's white; the
-// accent bars carry the item's color.
-static constexpr const char* White = "\"$FontColorWhite\"";
-static constexpr const char* Grey  = White;
-static auto NameColor(const char*) -> const char* {
-	return White;
 }
 
 static auto JsonString(const std::string& s) -> std::string {
@@ -1983,108 +1967,100 @@ static auto JsonString(const std::string& s) -> std::string {
 	return out + '"';
 }
 
-static auto TextStyle(const char* face, const char* size, const char* align, const char* color) -> std::string {
-	return std::string(R"({"fontFace":")") + face + R"(","fontColor":)" + color + R"(,"pointSize":")" + size + R"(","alignment":{"h":")" + align
+// Inline text colours render black, so all text uses the game's white; the colour bar
+// carries the item's colour.
+static auto TextStyle(const char* face, const char* size, const char* align) -> std::string {
+	return std::string(R"({"fontFace":")") + face + R"(","fontColor":"$FontColorWhite","pointSize":")" + size + R"(","alignment":{"h":")" + align
 		+ R"(","v":"center"},"dropShadow":"$DefaultDropShadow"})";
 }
 
-static auto Label(const std::string& name, int x, int y, int w, int h, const std::string& text, const std::string& style) -> std::string {
-	return R"({"type":"TextBoxWidget","name":)" + JsonString(name) + R"(,"fields":{"rect":{"x":)" + std::to_string(x) + R"(,"y":)" + std::to_string(y)
-		+ R"(,"width":)" + std::to_string(w) + R"(,"height":)" + std::to_string(h) + R"(},"text":)" + JsonString(text) + R"(,"visible":false,"style":)" + style + "}}";
+static auto Rect(int x, int y, int w, int h) -> std::string {
+	return R"({"x":)" + std::to_string(x) + R"(,"y":)" + std::to_string(y) + R"(,"width":)" + std::to_string(w) + R"(,"height":)" + std::to_string(h) + "}";
 }
 
-static auto StatusLayout() -> std::string {
-	// Anchored to the bottom left corner; the labels sit just above the screen edge.
-	std::string json = R"({"type":"Panel","name":"grailtrackrr/Status","fields":{"anchor":{"x":0.0,"y":1.0},"priority":8400},"children":[)";
-	const auto style = TextStyle("BlizzardGlobal", "$MediumFontSize", "left", White);
-	bool first = true;
-	for (const auto& k : StatusKinds) {
-		json += (first ? "" : ",") + Label(std::string("Status_") + k.id, 28, -66, 1500, 52, k.text, style);
-		first = false;
-	}
-	return json + "]}";
+static auto Label(const std::string& name, const std::string& rect, const std::string& text, const std::string& style) -> std::string {
+	return R"({"type":"TextBoxWidget","name":)" + JsonString(name) + R"(,"fields":{"rect":)" + rect + R"(,"text":)" + JsonString(text) + R"(,"style":)" + style + "}}";
 }
 
+// One panel: anchor, priority and its widgets.
+static auto PanelJson(const std::string& localId, float anchorX, float anchorY, int priority, const std::string& children) -> std::string {
+	char anchor[64];
+	std::snprintf(anchor, sizeof(anchor), R"({"x":%.1f,"y":%.1f})", anchorX, anchorY);
+	return R"({"type":"Panel","name":)" + JsonString(std::string("grailtrackrr/") + localId) + R"(,"fields":{"anchor":)" + anchor + R"(,"priority":)"
+		+ std::to_string(priority) + R"(},"children":[)" + children + "]}";
+}
+
+// Popup card geometry, relative to the anchor (top or middle of the screen, centred).
+static constexpr int CardWidth = 720, CardHeight = 112, CardX = -CardWidth / 2;
 // Width of one digit and of "% of your grail found" in layout units, at $MediumFontSize.
-static constexpr int PctDigit = 20, PctRest = 340;
+static constexpr int PctDigit = 20, PctRest = 340, PctY = 60;
 
-// 100% only needs "1 0 0", so the three-digit set has one label per position.
-static auto PctDigitLabel(int len, int pos, int digit) -> std::string {
-	return "Pct" + std::to_string(len) + "_" + std::to_string(pos) + "_" + std::to_string(len == 3 ? (pos == 0 ? 1 : 0) : digit);
-}
+struct PanelDef {
+	std::string id;     // local id, also the layout file name
+	std::string json;
+	D2RL::Panels::RegistrationHandle handle = D2RL::Panels::InvalidHandle;
+	bool        open = false;   // opened by us and not closed since
+};
 
-static auto PopupLayout(bool center) -> std::string {
-	// Flat: findWidget only looks at a panel's direct children. The card's widgets are
-	// placed relative to the anchor (top or middle of the screen, centred).
-	constexpr int Width = 720, Height = 112, X = -Width / 2;
-	const int Y = center ? -200 : 140;
-	auto rect = [&](int x, int y, int w, int h) {
-		return R"({"x":)" + std::to_string(X + x) + R"(,"y":)" + std::to_string(Y + y) + R"(,"width":)" + std::to_string(w) + R"(,"height":)" + std::to_string(h) + "}";
-	};
-	std::string json = std::string(R"({"type":"Panel","name":"grailtrackrr/Popup","fields":{"anchor":{"x":0.5,"y":)") + (center ? "0.5" : "0.0")
-		+ R"(},"priority":8500},"children":[)";
-	json += R"({"type":"RectangleWidget","name":"Back","fields":{"rect":)" + rect(0, 0, Width, Height) + R"(,"color":[0.05, 0.04, 0.03, 0.88]}})";
-	const auto headStyle  = TextStyle("Exocet", "$MediumFontSize", "center", White);
-	const auto digitStyle = TextStyle("BlizzardGlobal", "$MediumFontSize", "center", White);
-	const auto restStyle  = TextStyle("BlizzardGlobal", "$MediumFontSize", "left", White);
-	auto label = [&](const std::string& name, int x, int y, int w, int h, const std::string& text, const std::string& style) {
-		return R"(,{"type":"TextBoxWidget","name":)" + JsonString(name) + R"(,"fields":{"rect":)" + rect(x, y, w, h) + R"(,"text":)" + JsonString(text)
-			+ R"(,"style":)" + style + "}}";
-	};
+// All panels, built at load: Status_<kind>, Card_<kind>, Pct<len>_<pos>_<digit>, PctText<len>.
+static auto BuildPanels(bool center) -> std::vector<PanelDef> {
+	std::vector<PanelDef> panels;
+	const float anchorY = center ? 0.5F : 0.0F;
+	const int   cardY   = center ? -200 : 140;
+	for (const auto& k : StatusKinds) {
+		panels.push_back({ std::string("Status_") + k.id,
+			PanelJson(std::string("Status_") + k.id, 0.0F, 1.0F, 8400,
+				Label("Text", Rect(28, -66, 1500, 52), k.text, TextStyle("BlizzardGlobal", "$MediumFontSize", "left"))) });
+	}
 	for (const auto& k : PopupKinds) {
-		for (const auto& [edge, y] : { std::pair<const char*, int> { "Top", 0 }, std::pair<const char*, int> { "Bottom", Height - 3 } }) {
-			json += std::string(R"(,{"type":"RectangleWidget","name":"Accent)") + edge + "_" + k.cat + R"(","fields":{"rect":)" + rect(0, y, Width, 3)
+		std::string children = R"({"type":"RectangleWidget","name":"Back","fields":{"rect":)" + Rect(CardX, cardY, CardWidth, CardHeight)
+			+ R"(,"color":[0.05, 0.04, 0.03, 0.88]}})";
+		for (const int y : { 0, CardHeight - 3 }) {
+			children += R"(,{"type":"RectangleWidget","name":"Bar)" + std::to_string(y) + R"(","fields":{"rect":)" + Rect(CardX, cardY + y, CardWidth, 3)
 				+ R"(,"color":)" + k.color + "}}";
 		}
-		json += label(std::string("Heading_") + k.cat, 16, 10, Width - 32, 50, k.heading, headStyle);
+		children += "," + Label("Heading", Rect(CardX + 16, cardY + 10, CardWidth - 32, 50), k.heading, TextStyle("Exocet", "$MediumFontSize", "center"));
+		panels.push_back({ std::string("Card_") + k.cat, PanelJson(std::string("Card_") + k.cat, 0.5F, anchorY, 8500, children) });
 	}
-	// "NN% of your grail found", centred: for each length (1, 2 or 3 digits) one label per
-	// digit and position, then the rest of the line placed after them.
+	// "NN% of your grail found", centred: per length (1, 2 or 3 digits) a panel per digit
+	// and position, then the rest of the line. 100 needs only "1 0 0".
 	for (int len = 1; len <= 3; ++len) {
-		const int start = (Width - len * PctDigit - PctRest) / 2;
+		const int start = CardX + (CardWidth - len * PctDigit - PctRest) / 2;
 		for (int pos = 0; pos < len; ++pos) {
-			for (int d = (len == 3 ? (pos == 0 ? 1 : 0) : 0); d <= (len == 3 ? (pos == 0 ? 1 : 0) : 9); ++d) {
-				json += label(PctDigitLabel(len, pos, d), start + pos * PctDigit, 60, PctDigit, 40, std::to_string(d), digitStyle);
+			const int from = len == 3 ? (pos == 0 ? 1 : 0) : 0, to = len == 3 ? from : 9;
+			for (int d = from; d <= to; ++d) {
+				const std::string id = "Pct" + std::to_string(len) + "_" + std::to_string(pos) + "_" + std::to_string(d);
+				panels.push_back({ id, PanelJson(id, 0.5F, anchorY, 8510,
+					Label("Digit", Rect(start + pos * PctDigit, cardY + PctY, PctDigit, 40), std::to_string(d), TextStyle("BlizzardGlobal", "$MediumFontSize", "center"))) });
 			}
 		}
-		json += label("PctText" + std::to_string(len), start + len * PctDigit, 60, PctRest + 40, 40, "% of your grail found", restStyle);
+		const std::string id = "PctText" + std::to_string(len);
+		panels.push_back({ id, PanelJson(id, 0.5F, anchorY, 8510,
+			Label("Text", Rect(start + len * PctDigit, cardY + PctY, PctRest + 40, 40), "% of your grail found", TextStyle("BlizzardGlobal", "$MediumFontSize", "left"))) });
 	}
-	return json + "]}";
+	return panels;
 }
 
 struct PanelUi {
-	// Layout bytes stay alive for the plugin's lifetime (D2RLoader copies them anyway).
-	std::string                      statusJson;
-	std::string                      popupJson;
-	D2RL::Panels::RegistrationHandle status = D2RL::Panels::InvalidHandle;
-	D2RL::Panels::RegistrationHandle popup  = D2RL::Panels::InvalidHandle;
-	bool                             ready  = false;
-	std::vector<std::string>         statusLabels;  // every label that is shown or hidden
-	std::vector<std::string>         popupLabels;
-	std::unordered_map<std::string, D2RL::Widgets::WidgetHandle> handles;   // "panel/label"
+	std::vector<PanelDef>  panels;
+	bool                   ready = false;
 	// UI thread only from here.
-	std::string                      statusShown;   // status label now visible
-	bool                             statusOpen = false;
-	bool                             popupOpen  = false;
-	uint64_t                         popupUntil = 0;
-	bool                             popupShowing = false;   // a find is on screen
-	int                              popupHidePasses = 0;    // full hide passes left after an open
-	int                              statusApply = 0;
-	std::vector<std::string>         popupShown;    // popup labels now visible
-	std::atomic<bool>                tickQueued { false };
-	std::atomic<uint32_t>            lastError { 0 };   // last failing call, for the status command
-	std::string                      lastErrorWhat;
+	std::vector<std::string> popupShown;   // popup panels that should be open now
+	bool                   popupShowing = false;
+	uint64_t               popupUntil   = 0;
+	std::atomic<bool>      tickQueued { false };
+	std::atomic<uint32_t>  lastError { 0 };   // last failing call, for the status command
+	std::string            lastErrorWhat;
 };
 static PanelUi ui;
 
 static std::string panelSetup = "not started";   // why the panels are off, for the status command
 
-// Plugin load. Without the panel services the plugin still tracks; it just shows nothing in game.
+// Plugin load. Without the panel service the plugin still tracks; it just shows nothing in game.
 static void SetUpPanels(const D2RL::PluginContext* context) {
 	const D2RL::ResourceService* resources = nullptr;
 	auto fail = [&](const std::string& why) {
 		g.panels   = nullptr;
-		g.widgets  = nullptr;
 		panelSetup = why;
 		Log("GrailTrackrr: in-game panels are off: %s", why.c_str());
 	};
@@ -2102,53 +2078,22 @@ static void SetUpPanels(const D2RL::PluginContext* context) {
 	if (!D2RL::HasPanelServiceField(g.panels, D2RL::PanelServiceGetPanelInfoFieldEnd) || g.panels->openPanel == nullptr || g.panels->closePanel == nullptr) {
 		return fail("panel service version " + std::to_string(g.panels->serviceVersion) + " size " + std::to_string(g.panels->serviceSize));
 	}
-	const auto wq = context->QueryService(&g.widgets);
-	if (wq != D2RL::ServiceQueryResult::Success || g.widgets == nullptr) {
-		return fail("widget service query " + std::to_string(static_cast<int>(wq)));
-	}
-	// Only findPanel, findWidget and setWidgetVisible are used, which every version has.
-	if (!D2RL::HasWidgetServiceField(g.widgets, D2RL::WidgetServiceRequiredSize)) {
-		return fail("widget service version " + std::to_string(g.widgets->serviceVersion) + " size " + std::to_string(g.widgets->serviceSize));
-	}
-	ui.popupLabels.push_back("Back");
-	for (int len = 1; len <= 3; ++len) {
-		for (int pos = 0; pos < len; ++pos) {
-			for (int d = 0; d <= (len == 3 ? 0 : 9); ++d) {
-				ui.popupLabels.push_back(PctDigitLabel(len, pos, d));
-			}
-		}
-		ui.popupLabels.push_back("PctText" + std::to_string(len));
-	}
-	for (const auto& k : PopupKinds) {
-		for (const char* prefix : { "AccentTop_", "AccentBottom_", "Heading_" }) {
-			ui.popupLabels.push_back(prefix + std::string(k.cat));
-		}
-	}
-	for (const auto& k : StatusKinds) {
-		ui.statusLabels.push_back(std::string("Status_") + k.id);
-	}
-	ui.statusJson = StatusLayout();
-	ui.popupJson  = PopupLayout(g.config.popupCenter);
-	for (const auto& [path, json] : { std::pair<const char*, const std::string*> { "data/global/ui/layouts/grailtrackrr/Statushd.json", &ui.statusJson },
-	                                  std::pair<const char*, const std::string*> { "data/global/ui/layouts/grailtrackrr/Popuphd.json", &ui.popupJson } }) {
+	ui.panels = BuildPanels(g.config.popupCenter);
+	for (auto& p : ui.panels) {
+		const std::string path = "data/global/ui/layouts/grailtrackrr/" + p.id + "hd.json";
 		const D2RL::Resources::ResourceRegistration resource {
 			.structSize = D2RL::Resources::ResourceRegistrationSize,
-			.path       = path,
-			.bytes      = json->data(),
-			.byteCount  = json->size(),
+			.path       = path.c_str(),
+			.bytes      = p.json.data(),
+			.byteCount  = p.json.size(),
 		};
-		D2RL::Resources::RegistrationHandle handle = D2RL::Resources::InvalidHandle;
-		const auto r = resources->registerResource(context, &resource, &handle);
-		if (r != D2RL::Resources::Result::Success) {
-			return fail(std::string("registering ") + path + " returned " + std::to_string(static_cast<uint32_t>(r)));
+		D2RL::Resources::RegistrationHandle resourceHandle = D2RL::Resources::InvalidHandle;
+		if (const auto r = resources->registerResource(context, &resource, &resourceHandle); r != D2RL::Resources::Result::Success) {
+			return fail("registering " + path + " returned " + std::to_string(static_cast<uint32_t>(r)));
 		}
-	}
-	for (auto [id, handle] : { std::pair<const char*, D2RL::Panels::RegistrationHandle*> { StatusPanelId, &ui.status },
-	                           std::pair<const char*, D2RL::Panels::RegistrationHandle*> { PopupPanelId, &ui.popup } }) {
-		const D2RL::Panels::PanelRegistration reg { .structSize = D2RL::Panels::PanelRegistrationSize, .flags = D2RL::Panels::PanelFlags::None, .localId = id };
-		const auto r = g.panels->registerPanel(context, &reg, handle);
-		if (r != D2RL::Panels::Result::Success) {
-			return fail(std::string("registering panel ") + id + " returned " + std::to_string(static_cast<uint32_t>(r)));
+		const D2RL::Panels::PanelRegistration reg { .structSize = D2RL::Panels::PanelRegistrationSize, .flags = D2RL::Panels::PanelFlags::None, .localId = p.id.c_str() };
+		if (const auto r = g.panels->registerPanel(context, &reg, &p.handle); r != D2RL::Panels::Result::Success) {
+			return fail("registering panel " + p.id + " returned " + std::to_string(static_cast<uint32_t>(r)));
 		}
 	}
 	panelSetup = "ok";
@@ -2168,58 +2113,23 @@ static auto PanelOpen(const D2RL::PluginContext* context, D2RL::Panels::Registra
 	return g.panels->getPanelInfo(context, handle, &info) == D2RL::Panels::Result::Success && info.presentationState == D2RL::Panels::PresentationState::Open;
 }
 
-// Widget handles survive closing and reopening a panel, so each is looked up once.
-static auto Widget(const D2RL::PluginContext* context, const char* panel, const std::string& name) -> D2RL::Widgets::WidgetHandle {
-	const std::string key = std::string(panel) + "/" + name;
-	if (const auto it = ui.handles.find(key); it != ui.handles.end()) {
-		return it->second;
-	}
-	D2RL::Widgets::WidgetHandle root = D2RL::Widgets::InvalidHandle, child = D2RL::Widgets::InvalidHandle;
-	auto r = g.widgets->findPanel(context, panel, &root);
-	if (r == D2RL::Widgets::Result::Success) {
-		r = g.widgets->findWidget(context, root, name.c_str(), &child);
-	}
-	if (r != D2RL::Widgets::Result::Success) {
-		NoteUiError("finding " + name + " after " + std::to_string(ui.handles.size()) + " widgets", static_cast<uint32_t>(r));
-		return D2RL::Widgets::InvalidHandle;
-	}
-	ui.handles.emplace(key, child);
-	return child;
-}
-
-// Shows the wanted labels of a just-opened panel and hides the rest.
-static void ShowOnly(const D2RL::PluginContext* context, const char* panel, const std::vector<std::string>& labels, const std::vector<std::string>& wanted) {
-	for (const auto& name : labels) {
-		const auto w = Widget(context, panel, name);
-		if (w != D2RL::Widgets::InvalidHandle) {
-			const bool show = std::find(wanted.begin(), wanted.end(), name) != wanted.end();
-			NoteUiError("showing " + name, static_cast<uint32_t>(g.widgets->setWidgetVisible(context, w, show)));
+// Opens the wanted panels (again, if the game closed one) and closes the rest that are open.
+static void ShowPanels(const D2RL::PluginContext* context, const std::vector<std::string>& wanted) {
+	for (auto& p : ui.panels) {
+		const bool want = std::find(wanted.begin(), wanted.end(), p.id) != wanted.end();
+		if (want && !(p.open && PanelOpen(context, p.handle))) {
+			const auto r = g.panels->openPanel(context, p.handle);
+			NoteUiError("opening " + p.id, static_cast<uint32_t>(r));
+			p.open = r == D2RL::Panels::Result::Success;
+		} else if (!want && p.open) {
+			NoteUiError("closing " + p.id, static_cast<uint32_t>(g.panels->closePanel(context, p.handle)));
+			p.open = false;
 		}
 	}
 }
 
-// Sets which popup widgets are visible, touching only the ones that change.
-static void SetPopupShown(const D2RL::PluginContext* context, std::vector<std::string> shown) {
-	for (const auto& name : ui.popupShown) {
-		if (std::find(shown.begin(), shown.end(), name) == shown.end()) {
-			const auto w = Widget(context, PopupPanel, name);
-			if (w != D2RL::Widgets::InvalidHandle) {
-				NoteUiError("hiding " + name, static_cast<uint32_t>(g.widgets->setWidgetVisible(context, w, false)));
-			}
-		}
-	}
-	for (const auto& name : shown) {
-		if (std::find(ui.popupShown.begin(), ui.popupShown.end(), name) == ui.popupShown.end()) {
-			const auto w = Widget(context, PopupPanel, name);
-			if (w != D2RL::Widgets::InvalidHandle) {
-				NoteUiError("showing " + name, static_cast<uint32_t>(g.widgets->setWidgetVisible(context, w, true)));
-			}
-		}
-	}
-	ui.popupShown = std::move(shown);
-}
-
-static void ShowPopup(const D2RL::PluginContext* context, const Popup& p) {
+// The panels for one find: its card, then the percentage.
+static auto PopupPanels(const Popup& p) -> std::vector<std::string> {
 	// "Name (Ethereal)" is the ethereal copy of a catalog item.
 	std::string name = p.name;
 	bool        eth  = p.category == "eth";
@@ -2228,9 +2138,8 @@ static void ShowPopup(const D2RL::PluginContext* context, const Popup& p) {
 		eth = true;
 	}
 	const bool known = std::any_of(std::begin(PopupKinds), std::end(PopupKinds), [&](const PopupKind& k) { return p.category == k.cat; });
-	const std::string kind = eth ? "eth" : known ? p.category : "msg";
-	std::vector<std::string> shown { "Back", "AccentTop_" + kind, "AccentBottom_" + kind, "Heading_" + kind };
-	// The name and progress go to the console (the popup cannot show changing text).
+	std::vector<std::string> shown { std::string("Card_") + (eth ? "eth" : known ? p.category : "msg") };
+	// The name and progress go to the console (the card cannot show changing text).
 	Say("GrailTrackrr: %s%s%s", name.c_str(), eth ? " (Ethereal)" : "", p.detail.empty() ? "" : (" - " + p.detail).c_str());
 	// Progress: "123 / 403 found, 30.5%". Whole percent, rounded down (100 only when complete).
 	if (const auto pctAt = p.detail.rfind('%'); pctAt != std::string::npos) {
@@ -2239,21 +2148,19 @@ static void ShowPopup(const D2RL::PluginContext* context, const Popup& p) {
 			--start;
 		}
 		if (start < pctAt) {
-			const int pct = std::clamp(static_cast<int>(std::atof(p.detail.substr(start, pctAt - start).c_str())), 0, 100);
+			const int         pct    = std::clamp(static_cast<int>(std::atof(p.detail.substr(start, pctAt - start).c_str())), 0, 100);
 			const std::string digits = std::to_string(pct);
-			const int len = static_cast<int>(digits.size());
-			for (int pos = 0; pos < len; ++pos) {
-				shown.push_back(PctDigitLabel(len, pos, digits[static_cast<size_t>(pos)] - '0'));
+			const auto        len    = std::to_string(digits.size());
+			for (size_t pos = 0; pos < digits.size(); ++pos) {
+				shown.push_back("Pct" + len + "_" + std::to_string(pos) + "_" + digits[pos]);
 			}
-			shown.push_back("PctText" + std::to_string(len));
+			shown.push_back("PctText" + len);
 		}
 	}
-	SetPopupShown(context, std::move(shown));
-	ui.popupShowing = true;
-	ui.popupUntil   = NowMs() + static_cast<uint64_t>(g.config.popupSeconds * 1000.0F);
+	return shown;
 }
 
-// UI thread, about four times a second while in game and until the panels are closed after.
+// UI thread, four times a second.
 static void __cdecl UiTick(const D2RL::PluginContext* context, void*) noexcept {
 	ui.tickQueued = false;
 	try {
@@ -2270,63 +2177,31 @@ static void __cdecl UiTick(const D2RL::PluginContext* context, void*) noexcept {
 			status = g.statusLine;
 			if (g.config.popupSeconds <= 0.0F) {
 				g.popups.clear();
-			} else if (inGame && ui.popupOpen && ui.popupHidePasses == 0 && !ui.popupShowing && !g.popups.empty() && now >= g.popups.front().notBeforeMs) {
+			} else if (inGame && !ui.popupShowing && !g.popups.empty() && now >= g.popups.front().notBeforeMs) {
 				next = g.popups.front();
 				g.popups.pop_front();
 			}
 		}
-
-		// Status line: open while in game, reopened if the game closed it (loading screens).
-		if (inGame && g.config.showStatus) {
-			if (!PanelOpen(context, ui.status)) {
-				const auto opened = g.panels->openPanel(context, ui.status);
-				NoteUiError("opening the status line", static_cast<uint32_t>(opened));
-				ui.statusOpen  = opened == D2RL::Panels::Result::Success;
-				ui.statusShown.clear();
-			}
-			const std::string kind = std::string("Status_") + StatusKindFor(status);
-			if (ui.statusOpen && kind != ui.statusShown) {
-				ui.statusShown = kind;
-				ui.statusApply = 2;
-			}
-			if (ui.statusOpen && ui.statusApply > 0) {
-				--ui.statusApply;
-				ShowOnly(context, StatusPanel, ui.statusLabels, { ui.statusShown });
-			}
-		} else if (ui.statusOpen || PanelOpen(context, ui.status)) {
-			NoteUiError("closing the status line", static_cast<uint32_t>(g.panels->closePanel(context, ui.status)));
-			ui.statusOpen = false;
+		if (!inGame) {
+			ui.popupShowing = false;
+			ui.popupShown.clear();
+			ShowPanels(context, {});
+			return;
 		}
-
-		// Popup: the panel stays open (empty) while in game, so its widgets keep the
-		// visibility set here and a popup only flips a handful of them. Opening it shows
-		// every widget, so everything is hidden once after each open (twice, in case the
-		// game finishes showing the panel a frame later).
-		if (inGame) {
-			if (!ui.popupOpen || !PanelOpen(context, ui.popup)) {
-				const auto opened = g.panels->openPanel(context, ui.popup);
-				NoteUiError("opening the popup", static_cast<uint32_t>(opened));
-				ui.popupOpen       = opened == D2RL::Panels::Result::Success;
-				ui.popupShowing    = false;
-				ui.popupHidePasses = ui.popupOpen ? 2 : 0;
-			}
-			if (ui.popupOpen && ui.popupHidePasses > 0) {
-				--ui.popupHidePasses;
-				ShowOnly(context, PopupPanel, ui.popupLabels, {});
-				ui.popupShown.clear();
-			} else if (ui.popupShowing && now >= ui.popupUntil) {
-				SetPopupShown(context, {});
-				ui.popupShowing = false;
-			}
-			if (next) {
-				ShowPopup(context, *next);
-			}
-		} else if (ui.popupOpen || PanelOpen(context, ui.popup)) {
-			NoteUiError("closing the popup", static_cast<uint32_t>(g.panels->closePanel(context, ui.popup)));
-			ui.popupOpen    = false;
+		if (ui.popupShowing && now >= ui.popupUntil) {
 			ui.popupShowing = false;
 			ui.popupShown.clear();
 		}
+		if (next) {
+			ui.popupShown   = PopupPanels(*next);
+			ui.popupShowing = true;
+			ui.popupUntil   = now + static_cast<uint64_t>(g.config.popupSeconds * 1000.0F);
+		}
+		std::vector<std::string> wanted = ui.popupShown;
+		if (g.config.showStatus) {
+			wanted.push_back(std::string("Status_") + StatusKindFor(status));
+		}
+		ShowPanels(context, wanted);
 	} catch (...) {
 	}
 }
