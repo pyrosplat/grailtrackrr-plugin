@@ -45,7 +45,7 @@
 
 namespace fs = std::filesystem;
 
-static constexpr const char* PluginVersion = "1.0.3";
+static constexpr const char* PluginVersion = "1.0.5";
 
 static constexpr D2RL::PluginInfo GrailTrackrrInfo {
 	.infoSize    = D2RL::PluginInfoSize,
@@ -78,6 +78,8 @@ struct Config {
 	// Reads each item's own stat rolls (exact rolls on the site, runeword detection).
 	// A switch so it can be turned off while chasing the leaked-stats assertion on exit.
 	bool        itemStats    = true;
+	bool        itemPopups   = true;   // in-game card for a new grail item
+	bool        badgePopups  = true;   // in-game card for a badge earned
 	// Not in the default config: turns the item check off entirely, for troubleshooting.
 	bool        scanItems    = true;
 };
@@ -119,6 +121,9 @@ struct State {
 	int32_t                      fieldAreaId     = -1;   // last area outside town, where a death happened
 	// Items already seen this game, by ItemKey (not the bare seed: see ItemKey).
 	std::unordered_set<uint64_t> knownSeeds;
+	// Runes held, by code, counting stack quantities (the Runes stash tab stacks them, and a
+	// rune's seed changes on every load). A count going up during play is a rune find.
+	std::unordered_map<std::string, int> runeTotals;
 	std::unordered_set<uint64_t> runewordSeeds;
 	// Socketed item count last checked for runeword status, by seed.
 	std::unordered_map<uint64_t, uint32_t> socketChecked;
@@ -311,6 +316,10 @@ static void ParseConfig(const std::string& text) {
 			g.config.scanOnGame = value != "ui";
 		} else if (key == "item_text") {
 			g.config.itemText = IsOn(value);
+		} else if (key == "item_popup") {
+			g.config.itemPopups = IsOn(value);
+		} else if (key == "badge_popup") {
+			g.config.badgePopups = IsOn(value);
 		} else if (key == "item_stats") {
 			g.config.itemStats = IsOn(value);
 		} else if (key == "scan_items") {
@@ -606,6 +615,17 @@ static auto IsCandidate(const D2RL::Items::ItemInfo& item) -> bool {
 	return item.quality == D2RL::Items::Quality::Unique || item.quality == D2RL::Items::Quality::Set || IsRuneCode(CodeString(item.code));
 }
 
+// Runes held by code, counting each stack's quantity.
+static auto RuneTotals(const std::vector<D2RL::Items::ItemInfo>& items) -> std::unordered_map<std::string, int> {
+	std::unordered_map<std::string, int> totals;
+	for (const auto& item : items) {
+		if (const auto code = CodeString(item.code); IsRuneCode(code)) {
+			totals[code] += item.quantity > 0 ? item.quantity : 1;
+		}
+	}
+	return totals;
+}
+
 // Runes.txt row of a finished runeword, or -1. UI thread only. Only items with
 // every socket filled can be runewords, so other items are skipped cheaply.
 static auto RunewordRow(const D2RL::Items::ItemInfo& item) -> int32_t {
@@ -762,6 +782,11 @@ static void HandleReply(const std::string& body) {
 		} else if (parts[0] == "TEST") {
 			g.testMode = parts.size() >= 2 && parts[1] == "1";
 		} else if (parts[0] == "POPUP" && parts.size() >= 4) {
+			// item_popup / badge_popup turn the in-game cards off; the console still gets them.
+			if (!(parts[1] == "badge" ? g.config.badgePopups : g.config.itemPopups)) {
+				Say(parts[1] == "badge" ? "GrailTrackrr: badge earned: %s (%s)" : "GrailTrackrr: %s - %s", parts[2].c_str(), parts[3].c_str());
+				continue;
+			}
 			g.popups.push_back(Popup { parts[1], parts[2], parts[3] });
 			if (g.popups.size() > 4) {
 				g.popups.pop_front();
@@ -1637,6 +1662,7 @@ static void __cdecl ScanOnUiThread(const D2RL::PluginContext* context, void*) no
 					g.knownSeeds.insert(ItemKey(item));
 					g.socketChecked[ItemKey(item)] = item.socketedItemCount;
 				}
+				g.runeTotals = RuneTotals(scan.items);
 				for (const auto& [seed, row] : runewords) {
 					g.runewordSeeds.insert(seed);
 				}
@@ -1670,17 +1696,37 @@ static void __cdecl ScanOnUiThread(const D2RL::PluginContext* context, void*) no
 			return;
 		}
 
-		// Pass 1 (locked): new seeds, and known items whose filled sockets changed.
+		// Pass 1 (locked): new seeds, and known items whose filled sockets changed. Runes are
+		// found by their count going up instead (stacks, and seeds that are not stable).
 		std::vector<D2RL::Items::ItemInfo> fresh;
 		std::vector<D2RL::Items::ItemInfo> recheck;
 		{
 			std::lock_guard guard(g.lock);
+			const auto totals = RuneTotals(scan.items);
+			if (totals != g.runeTotals) {
+				std::string changes;
+				for (const auto& [code, count] : totals) {
+					const auto before = g.runeTotals.contains(code) ? g.runeTotals.at(code) : 0;
+					if (count > before) {
+						changes += " " + code + " " + std::to_string(before) + "->" + std::to_string(count);
+						// Report one rune item of that code (its seed is not used for runes).
+						const auto it = std::find_if(scan.items.begin(), scan.items.end(), [&](const auto& i) { return CodeString(i.code) == code; });
+						if (it != scan.items.end()) {
+							fresh.push_back(*it);
+						}
+					}
+				}
+				if (!changes.empty()) {
+					Log("GrailTrackrr: runes picked up:%s", changes.c_str());
+				}
+				g.runeTotals = totals;
+			}
 			for (const auto& item : scan.items) {
 				const bool isNew   = g.knownSeeds.insert(ItemKey(item)).second;
 				auto&      checked = g.socketChecked[ItemKey(item)];
 				const bool sockets = item.socketCount > 0 && item.socketedItemCount == item.socketCount && (isNew || checked != item.socketedItemCount);
 				checked            = item.socketedItemCount;
-				if (isNew && IsCandidate(item)) {
+				if (isNew && IsCandidate(item) && !IsRuneCode(CodeString(item.code))) {
 					fresh.push_back(item);
 				} else if (sockets && !g.runewordSeeds.contains(ItemKey(item))) {
 					recheck.push_back(item);
@@ -1786,6 +1832,7 @@ static void __cdecl OnGameplayEvent(const D2RL::PluginContext*, const D2RL::Life
 				g.baselinePending = true;
 				g.readyAtMs       = NowMs();
 				g.knownSeeds.clear();
+				g.runeTotals.clear();
 				g.runewordSeeds.clear();
 				g.socketChecked.clear();
 				g.statsSent.clear();

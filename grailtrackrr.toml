@@ -5,7 +5,11 @@
 # From the My grail page on grailtrackrr.com. Keep it private.
 api_key = ""
 
-# Popup for each new grail item (seconds on screen; 0 turns it off).
+# In-game card for each new grail item, and for each badge earned.
+item_popup = true
+badge_popup = true
+
+# How long each card stays on screen, in seconds.
 popup_seconds = 6
 
 # Connection line in the bottom-left corner while in game.

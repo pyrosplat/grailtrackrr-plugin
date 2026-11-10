@@ -17,7 +17,9 @@ In game, the console command `grailtrackrr` shows the connection status.
 | Key | Default | |
 | --- | --- | --- |
 | `api_key` | | From the My grail page. Keep it private |
-| `popup_seconds` | `6` | How long the popup for a new grail item stays; `0` turns it off |
+| `item_popup` | `true` | In-game card for each new grail item |
+| `badge_popup` | `true` | In-game card for each badge earned |
+| `popup_seconds` | `6` | How long each card stays on screen |
 | `show_status` | `true` | Connection line in the bottom-left corner |
 
 Self-hosting: add `server_url = "http://localhost:8080"` (or your own https address).
