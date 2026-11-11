@@ -45,7 +45,7 @@
 
 namespace fs = std::filesystem;
 
-static constexpr const char* PluginVersion = "1.0.5";
+static constexpr const char* PluginVersion = "1.0.6";
 
 static constexpr D2RL::PluginInfo GrailTrackrrInfo {
 	.infoSize    = D2RL::PluginInfoSize,
@@ -1193,6 +1193,7 @@ static void SendBaseline(const std::vector<D2RL::Items::ItemInfo>& items, const 
 	JsonInt(ev, "clvl", level);
 	JsonBool(ev, "hardcore", hardcore);
 	JsonInt(ev, "ts", static_cast<long long>(WallMs()));
+	JsonBool(ev, "cube", true); // this snapshot includes the Cube (older plugins left it out)
 	JsonKey(ev, "items") += '[';
 	bool first = true;
 	for (const auto& item : items) {
@@ -1385,9 +1386,18 @@ static auto EquippedSignature(const std::vector<D2RL::Items::ItemInfo>& items) -
 	return sig;
 }
 
-// Inventory and belt: what the character carries (charms in the inventory count toward stats).
+// Inventory, belt and Horadric Cube: what the character carries (charms in the inventory count toward stats).
 static auto IsCarried(const D2RL::Items::ItemInfo& item) -> bool {
-	return item.container == D2RL::Items::ItemContainer::Inventory || item.container == D2RL::Items::ItemContainer::Belt;
+	return item.container == D2RL::Items::ItemContainer::Inventory || item.container == D2RL::Items::ItemContainer::Belt
+	    || item.container == D2RL::Items::ItemContainer::Cube;
+}
+
+static auto CarriedContainer(const D2RL::Items::ItemInfo& item) -> const char* {
+	switch (item.container) {
+	case D2RL::Items::ItemContainer::Belt: return "belt";
+	case D2RL::Items::ItemContainer::Cube: return "cube";
+	default:                               return "inventory";
+	}
 }
 
 static auto CarriedSignature(const std::vector<D2RL::Items::ItemInfo>& items) -> std::string {
@@ -1401,7 +1411,7 @@ static auto CarriedSignature(const std::vector<D2RL::Items::ItemInfo>& items) ->
 	return sig;
 }
 
-// UI thread: where every carried item sits. Grail items (and runewords) also carry their
+// UI thread: where every carried item sits (inventory, belt, Cube). Grail items (and runewords) also carry their
 // exact stats, once per game for each item; the server keeps them between snapshots.
 static void SendItems(const std::vector<D2RL::Items::ItemInfo>& items) {
 	std::string charName;
@@ -1442,7 +1452,7 @@ static void SendItems(const std::vector<D2RL::Items::ItemInfo>& items) {
 			JsonInt(ev, "rw", rw);
 		}
 		JsonBool(ev, "eth", (item.stateFlags & D2RL::Items::ItemStateEthereal) != 0);
-		JsonStr(ev, "c", item.container == D2RL::Items::ItemContainer::Belt ? "belt" : "inventory");
+		JsonStr(ev, "c", CarriedContainer(item));
 		JsonInt(ev, "x", item.x);
 		JsonInt(ev, "y", item.y);
 		JsonInt(ev, "sk", static_cast<int32_t>(item.socketCount));
@@ -1783,7 +1793,7 @@ static void __cdecl ScanOnUiThread(const D2RL::PluginContext* context, void*) no
 				// last live snapshot, so send a fresh one alongside.
 				g.itemsDirty = true;
 			}
-			// Inventory and belt: resend when anything moves, at most every 5 s.
+			// Inventory, belt and Cube: resend when anything moves, at most every 5 s.
 			const std::string carried = CarriedSignature(scan.items);
 			if (carried != g.itemsSignature) {
 				g.itemsSignature = carried;
