@@ -45,7 +45,7 @@
 
 namespace fs = std::filesystem;
 
-static constexpr const char* PluginVersion = "1.0.7";
+static constexpr const char* PluginVersion = "1.0.8";
 
 static constexpr D2RL::PluginInfo GrailTrackrrInfo {
 	.infoSize    = D2RL::PluginInfoSize,
@@ -124,6 +124,7 @@ struct State {
 	// Runes held, by code, counting stack quantities (the Runes stash tab stacks them, and a
 	// rune's seed changes on every load). A count going up during play is a rune find.
 	std::unordered_map<std::string, int> runeTotals;
+	std::unordered_map<uint64_t, int>    runewordTries; // scans spent looking for a new runeword (see the item scan)
 	std::unordered_set<uint64_t> runewordSeeds;
 	// Socketed item count last checked for runeword status, by seed.
 	std::unordered_map<uint64_t, uint32_t> socketChecked;
@@ -1193,7 +1194,6 @@ static void SendBaseline(const std::vector<D2RL::Items::ItemInfo>& items, const 
 	JsonInt(ev, "clvl", level);
 	JsonBool(ev, "hardcore", hardcore);
 	JsonInt(ev, "ts", static_cast<long long>(WallMs()));
-	JsonBool(ev, "cube", true); // this snapshot includes the Cube (older plugins left it out)
 	JsonKey(ev, "items") += '[';
 	bool first = true;
 	for (const auto& item : items) {
@@ -1429,6 +1429,7 @@ static void SendItems(const std::vector<D2RL::Items::ItemInfo>& items) {
 	JsonStr(ev, "charName", charName);
 	JsonInt(ev, "clvl", clvl);
 	JsonInt(ev, "ts", static_cast<long long>(WallMs()));
+	JsonBool(ev, "cube", true); // this snapshot includes the Cube (older plugins left it out)
 	JsonKey(ev, "items") += '[';
 	bool                  first = true;
 	std::vector<uint64_t> withStats;
@@ -1734,7 +1735,17 @@ static void __cdecl ScanOnUiThread(const D2RL::PluginContext* context, void*) no
 			for (const auto& item : scan.items) {
 				const bool isNew   = g.knownSeeds.insert(ItemKey(item)).second;
 				auto&      checked = g.socketChecked[ItemKey(item)];
-				const bool sockets = item.socketCount > 0 && item.socketedItemCount == item.socketCount && (isNew || checked != item.socketedItemCount);
+				auto&      tries   = g.runewordTries[ItemKey(item)];
+				if (isNew || checked != item.socketedItemCount) {
+					tries = 0;
+				}
+				// The game can mark an item as a runeword a moment after the last rune goes in,
+				// so a full white item is checked again on the next few scans, not just once.
+				const bool full    = item.socketCount > 0 && item.socketedItemCount == item.socketCount;
+				const bool sockets = full && tries < 10;
+				if (sockets) {
+					tries++;
+				}
 				checked            = item.socketedItemCount;
 				if (isNew && IsCandidate(item) && !IsRuneCode(CodeString(item.code))) {
 					fresh.push_back(item);
@@ -1845,6 +1856,7 @@ static void __cdecl OnGameplayEvent(const D2RL::PluginContext*, const D2RL::Life
 				g.runeTotals.clear();
 				g.runewordSeeds.clear();
 				g.socketChecked.clear();
+				g.runewordTries.clear();
 				g.statsSent.clear();
 				g.itemsSignature.clear();
 				g.clvl       = 0;

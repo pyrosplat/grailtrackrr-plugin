@@ -39,7 +39,7 @@ jobs:
         shell: pwsh
         run: |
           $name = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { "dev-$($env:GITHUB_SHA.Substring(0,7))" }
-          Copy-Item LICENSE.md dist\
+          Copy-Item README.md, LICENSE.md dist\
           $zip = "grailtrackrr-plugin-$name.zip"
           Compress-Archive -Path dist\* -DestinationPath $zip
           "ZIP=$zip" | Out-File $env:GITHUB_ENV -Append
