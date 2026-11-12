@@ -45,7 +45,7 @@
 
 namespace fs = std::filesystem;
 
-static constexpr const char* PluginVersion = "1.0.8";
+static constexpr const char* PluginVersion = "1.0.9";
 
 static constexpr D2RL::PluginInfo GrailTrackrrInfo {
 	.infoSize    = D2RL::PluginInfoSize,
@@ -1913,8 +1913,9 @@ static void __cdecl OnGameplayEvent(const D2RL::PluginContext*, const D2RL::Life
 				}
 				break;
 			case K::QuestCompleted:
-				if (event->difficulty <= 2) {
-					g.difficulty = static_cast<int32_t>(event->difficulty);
+				if (event->difficulty <= 2 && g.difficulty != static_cast<int32_t>(event->difficulty)) {
+					g.difficulty    = static_cast<int32_t>(event->difficulty);
+					g.presenceDirty = true;
 				}
 				break;
 			default:
@@ -1930,8 +1931,12 @@ static void __cdecl OnMonsterDeath(const D2RL::PluginContext*, const D2RL::Lifec
 		return;
 	}
 	std::lock_guard guard(g.lock);
-	g.lastKill   = LastKill { event->monster.classId, event->levelId, NowMs() };
-	g.difficulty = static_cast<int32_t>(event->difficulty);
+	g.lastKill = LastKill { event->monster.classId, event->levelId, NowMs() };
+	// The first kill of a game tells us the difficulty: let the site know right away.
+	if (event->difficulty <= 2 && g.difficulty != static_cast<int32_t>(event->difficulty)) {
+		g.difficulty    = static_cast<int32_t>(event->difficulty);
+		g.presenceDirty = true;
+	}
 }
 
 // UI messages tell us which panel is open. The exact target names can change
