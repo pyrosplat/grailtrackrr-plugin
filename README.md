@@ -29,6 +29,7 @@ Only to the `server_url` you set, signed with your API key:
 - **New items** you pick up, gamble, buy or make in the Cube: item code, quality, item level, seed and stats, plus where you were (area, difficulty, character level, last monster killed).
 - **Your character**: the `.d2s` save file of the loaded character when the game writes it (for gear, stats, skills and merc), and level-ups.
 - **Presence**: that you are playing, your area and difficulty, about once a minute. **Deaths**, with the area.
+- **Races**: act boss kills (Andariel, Duriel, Mephisto, Diablo, Baal) and quests completed, with difficulty and time.
 - **Save folder check**: the names and levels of the characters in your save folder and whether the shared stash is empty, used to confirm a clean grail start.
 
 Nothing else from your PC. If the server cannot be reached, unsent events wait in `%LOCALAPPDATA%\GrailTrackrr\outbox.jsonl` and go out on the next connection.

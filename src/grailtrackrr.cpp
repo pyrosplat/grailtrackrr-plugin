@@ -45,7 +45,7 @@
 
 namespace fs = std::filesystem;
 
-static constexpr const char* PluginVersion = "1.0.9";
+static constexpr const char* PluginVersion = "1.0.10";
 
 static constexpr D2RL::PluginInfo GrailTrackrrInfo {
 	.infoSize    = D2RL::PluginInfoSize,
@@ -180,6 +180,9 @@ struct State {
 	uint64_t                     nextPingMs   = 0;
 
 	std::atomic<bool> scanQueued { false };
+	// When the pending scan was queued. Leaving a game discards queued game-thread work, so a
+	// scan queued just before that never runs; the worker re-queues one that is overdue.
+	std::atomic<uint64_t> scanQueuedAtMs { 0 };
 	uint64_t          nextScanMs = 0;
 };
 
@@ -1847,6 +1850,8 @@ static void __cdecl OnGameplayEvent(const D2RL::PluginContext*, const D2RL::Life
 		switch (event->kind) {
 			case K::GameJoined:
 				g.sessionGen = event->sessionGeneration;
+				// Work queued for the last game was discarded with it.
+				g.scanQueued = false;
 				break;
 			case K::LocalPlayerReady:
 				g.inGame          = true;
@@ -1867,8 +1872,9 @@ static void __cdecl OnGameplayEvent(const D2RL::PluginContext*, const D2RL::Life
 				g.openPanel.clear();
 				break;
 			case K::GameLeft:
-				g.inGame   = false;
-				g.leftAtMs = NowMs();
+				g.inGame     = false;
+				g.leftAtMs   = NowMs();
+				g.scanQueued = false;
 				if (!g.charName.empty()) {
 					std::string ev = "{";
 					JsonStr(ev, "type", "presence");
@@ -1917,6 +1923,18 @@ static void __cdecl OnGameplayEvent(const D2RL::PluginContext*, const D2RL::Life
 					g.difficulty    = static_cast<int32_t>(event->difficulty);
 					g.presenceDirty = true;
 				}
+				// Quests completed, for races (and to learn the quest numbers).
+				if (!g.charName.empty()) {
+					std::string ev = "{";
+					JsonStr(ev, "type", "quest");
+					JsonStr(ev, "charName", g.charName);
+					JsonInt(ev, "questId", static_cast<long long>(event->questRecordId));
+					JsonInt(ev, "difficulty", static_cast<long long>(event->difficulty));
+					JsonInt(ev, "clvl", g.clvl);
+					JsonInt(ev, "ts", static_cast<long long>(WallMs()));
+					ev += '}';
+					QueueEventLocked(std::move(ev));
+				}
 				break;
 			default:
 				break;
@@ -1932,6 +1950,20 @@ static void __cdecl OnMonsterDeath(const D2RL::PluginContext*, const D2RL::Lifec
 	}
 	std::lock_guard guard(g.lock);
 	g.lastKill = LastKill { event->monster.classId, event->levelId, NowMs() };
+	// Act bosses (Andariel, Duriel, Mephisto, Diablo, Baal): report right away for races.
+	const uint32_t cls = event->monster.classId;
+	if ((cls == 156 || cls == 211 || cls == 242 || cls == 243 || cls == 545) && !g.charName.empty()) {
+		std::string ev = "{";
+		JsonStr(ev, "type", "kill");
+		JsonStr(ev, "charName", g.charName);
+		JsonInt(ev, "classId", static_cast<long long>(cls));
+		JsonInt(ev, "levelId", event->levelId);
+		JsonInt(ev, "difficulty", static_cast<long long>(event->difficulty));
+		JsonInt(ev, "clvl", g.clvl);
+		JsonInt(ev, "ts", static_cast<long long>(WallMs()));
+		ev += '}';
+		QueueEventLocked(std::move(ev));
+	}
 	// The first kill of a game tells us the difficulty: let the site know right away.
 	if (event->difficulty <= 2 && g.difficulty != static_cast<int32_t>(event->difficulty)) {
 		g.difficulty    = static_cast<int32_t>(event->difficulty);
@@ -2417,7 +2449,13 @@ static void WorkerLoop() {
 				std::lock_guard guard(g.lock);
 				inGame = g.inGame;
 			}
+			// A scan queued just before a game ended was thrown away with that game: try again.
+			if (g.scanQueued && now > g.scanQueuedAtMs + 5'000) {
+				Log("GrailTrackrr: an item scan never ran (the game changed); scanning again.");
+				g.scanQueued = false;
+			}
 			if (inGame && now >= g.nextScanMs && !g.scanQueued.exchange(true)) {
+				g.scanQueuedAtMs = now;
 				g.nextScanMs = now + 1'000;
 				const auto queued = g.config.scanOnGame && g.threads->runOnGameThread != nullptr ? g.threads->runOnGameThread(g.ctx, ScanOnUiThread, nullptr)
 				                                                                                : g.threads->runOnUiThread(g.ctx, ScanOnUiThread, nullptr);
