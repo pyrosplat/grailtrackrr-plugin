@@ -8,7 +8,7 @@ Created by PyroSplat. Not affiliated with Blizzard Entertainment.
 1. Install [D2RLoader](https://d2rloader.net/download.html) and check the game starts with it.
 2. Get GrailTrackrr from the [D2RLoader plugin hub](https://d2rloader.net/hub/plugins/grailtrackrr-live-grail-sharing) (or [Releases](https://github.com/pyrosplat/grailtrackrr-plugin/releases/latest) here) and copy `d2rl-grailtrackrr.dll` into `<game folder>\d2rloader\plugins`. Each GitHub release lists the file's SHA-256 so you can check your download.
 3. Start the game once. D2RLoader creates `<game folder>\d2rloader\config\grailtrackrr.toml`.
-4. Sign up at grailtrackrr.com, open **My grail**, copy your API key and paste it as `api_key` in that file.
+4. Sign up at grailtrackrr.com, open **Profile**, copy your API key and paste it as `api_key` in that file.
 5. Start a grail on the site, then load a new level 1 character with an empty shared stash. The grail starts on its own.
 
 In game, the console command `grailtrackrr` shows the connection status.
@@ -16,7 +16,7 @@ In game, the console command `grailtrackrr` shows the connection status.
 ## Settings (`grailtrackrr.toml`)
 | Key | Default | |
 | --- | --- | --- |
-| `api_key` | | From the My grail page. Keep it private |
+| `api_key` | | From the Profile page. Keep it private |
 | `item_popup` | `true` | In-game card for each new grail item |
 | `badge_popup` | `true` | In-game card for each badge earned |
 | `popup_seconds` | `6` | How long each card stays on screen |

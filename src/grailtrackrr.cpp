@@ -45,7 +45,7 @@
 
 namespace fs = std::filesystem;
 
-static constexpr const char* PluginVersion = "1.0.11";
+static constexpr const char* PluginVersion = "1.0.12";
 
 static constexpr D2RL::PluginInfo GrailTrackrrInfo {
 	.infoSize    = D2RL::PluginInfoSize,
@@ -1089,7 +1089,7 @@ static void ReportFailure(const HttpResult& r) {
 		SetStatus(false, "GrailTrackrr: cannot reach " + url + " (" + r.error + ")" +
 			(waiting > 0 ? ", " + std::to_string(waiting) + " find(s) saved to send later" : std::string()));
 	} else if (r.status == 401) {
-		SetStatus(false, "GrailTrackrr: API key rejected, copy it again from the My grail page");
+		SetStatus(false, "GrailTrackrr: API key rejected, copy it again from the Profile page");
 	} else if (r.status == 404) {
 		SetStatus(false, "GrailTrackrr: " + url + " is not a GrailTrackrr server (404)");
 	} else {
@@ -2234,9 +2234,9 @@ struct StatusKind {
 };
 static constexpr StatusKind StatusKinds[] {
 	{ "connected",  "GrailTrackrr: connected" },
-	{ "notstarted", "GrailTrackrr: grail not started, see My grail on the site" },
+	{ "notstarted", "GrailTrackrr: grail not started, see Profile on the site" },
 	{ "offline",    "GrailTrackrr: offline, finds are saved and sent later" },
-	{ "badkey",     "GrailTrackrr: API key rejected, copy it again from My grail" },
+	{ "badkey",     "GrailTrackrr: API key rejected, copy it again from Profile" },
 	{ "nokey",      "GrailTrackrr: set api_key in grailtrackrr.toml" },
 	{ "error",      "GrailTrackrr: problem, type grailtrackrr in the console" },
 };

@@ -2,7 +2,7 @@
 # D2RLoader copies this to d2rloader/config/grailtrackrr.toml the first time it runs.
 
 [grailtrackrr]
-# From the My grail page on grailtrackrr.com. Keep it private.
+# From the Profile page on grailtrackrr.com. Keep it private.
 api_key = ""
 
 # In-game card for each new grail item, and for each badge earned.
