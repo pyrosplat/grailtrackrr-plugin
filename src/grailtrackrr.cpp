@@ -45,7 +45,7 @@
 
 namespace fs = std::filesystem;
 
-static constexpr const char* PluginVersion = "1.0.10";
+static constexpr const char* PluginVersion = "1.0.11";
 
 static constexpr D2RL::PluginInfo GrailTrackrrInfo {
 	.infoSize    = D2RL::PluginInfoSize,
@@ -159,6 +159,25 @@ struct State {
 	uint32_t                     failures     = 0;
 	// Display.
 	std::deque<Popup>            popups;
+
+	// Races (from the server's RACE reply line): what to show, when to check, the start time.
+	std::string                  raceState    = "none";   // none | check | ready | waiting | running | done
+	bool                         raceNeedCheck = false;
+	uint64_t                     raceStartMs  = 0;        // local NowMs() of the start (or of this racer's start)
+	bool                         raceStartKnown = false;
+	std::string                  raceTitle;
+	bool                         raceCheckPending = false;
+	std::string                  raceCheckPhase = "ready";
+	uint64_t                     lastRaceCheckMs = 0;
+	bool                         raceGoShown = false;
+	// This game: monsters killed (a race character must start with none) and whether another
+	// player killed something (a TCP/IP game).
+	uint32_t                     killsThisGame = 0;
+	uint32_t                     localPlayerId = 0xFFFFFFFFU;
+	bool                         multiplayer   = false;
+	// Shared stash: items seen in the last scan.
+	uint32_t                     sharedItems   = 0;
+	int32_t                      charClass     = -1;
 
 	// Test accounts: "grailtrackrr spawn ..." (see the Test mode section).
 	struct SpawnSpec {
@@ -411,6 +430,7 @@ static void JsonStr(std::string& out, const char* key, const std::string& v) {
 struct SaveChar {
 	std::string     name;
 	int             level    = 0;
+	int             cls      = -1;
 	bool            hardcore = false;
 	fs::file_time_type modified {};
 	fs::path        path;
@@ -500,6 +520,48 @@ static auto LevelFromStats(const std::vector<unsigned char>& data) -> int {
 	}
 	return 0;
 }
+// When a save file was created (ms since 1970), or 0. A race character must be new.
+static auto CreatedMs(const fs::path& path) -> long long {
+	WIN32_FILE_ATTRIBUTE_DATA data {};
+	if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) {
+		return 0;
+	}
+	const uint64_t ticks = (static_cast<uint64_t>(data.ftCreationTime.dwHighDateTime) << 32) | data.ftCreationTime.dwLowDateTime;
+	if (ticks < 116444736000000000ULL) {
+		return 0;
+	}
+	return static_cast<long long>((ticks - 116444736000000000ULL) / 10'000ULL);
+}
+
+// Gold in the shared stash file: every page starts 0xAA55AA55, with its gold at +12 and
+// its size at +16. Items are counted by the item scan instead.
+static auto SharedStashGold(bool hardcore) -> long long {
+	const fs::path file = SaveFolder() / (hardcore ? L"SharedStashHardCoreV2.d2i" : L"SharedStashSoftCoreV2.d2i");
+	std::ifstream in(file, std::ios::binary);
+	if (!in) {
+		return 0;
+	}
+	std::vector<unsigned char> data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+	const auto u32 = [&](size_t at) -> uint32_t {
+		return at + 4 <= data.size() ? static_cast<uint32_t>(data[at]) | (static_cast<uint32_t>(data[at + 1]) << 8) | (static_cast<uint32_t>(data[at + 2]) << 16)
+			| (static_cast<uint32_t>(data[at + 3]) << 24) : 0;
+	};
+	long long gold = 0;
+	size_t    at   = 0;
+	for (int guard = 0; guard < 64 && at + 64 <= data.size(); ++guard) {
+		if (u32(at) != 0xAA55AA55U) {
+			break;
+		}
+		gold += u32(at + 12);
+		const uint32_t size = u32(at + 16);
+		if (size < 64) {
+			break;
+		}
+		at += size;
+	}
+	return gold;
+}
+
 // The file name is the character name.
 static auto ScanSaves() -> std::vector<SaveChar> {
 	std::vector<SaveChar> out;
@@ -519,6 +581,7 @@ static auto ScanSaves() -> std::vector<SaveChar> {
 		const HeaderOffsets at = OffsetsFor(header);
 		c.hardcore = (header[at.status] & 0x04) != 0;
 		c.level    = header[at.level];
+		c.cls      = header[at.cls] <= 6 ? header[at.cls] : -1;
 		if (c.level < 1 || c.level > 99) {
 			file.clear();
 			file.seekg(0);
@@ -783,11 +846,31 @@ static void HandleReply(const std::string& body) {
 			} else {
 				g.statusLine = "GrailTrackrr: " + parts[2];
 			}
+		} else if (parts[0] == "RACE" && parts.size() >= 4) {
+			// RACE <state> <1 = check now> <ms to the start> <title> <message>
+			const std::string before = g.raceState;
+			g.raceState     = parts[1];
+			g.raceNeedCheck = parts[2] == "1";
+			const long long toStart = std::atoll(parts[3].c_str());
+			g.raceStartMs    = static_cast<uint64_t>(static_cast<long long>(NowMs()) + toStart);
+			g.raceStartKnown = g.raceState != "none";
+			g.raceTitle      = parts.size() >= 5 ? parts[4] : "";
+			if (g.raceState != before && (g.raceState == "check" || g.raceState == "ready")) {
+				g.raceCheckPhase = "ready";
+			}
+			if (g.raceState != before) {
+				Log("GrailTrackrr: race %s: %s", g.raceState.c_str(), parts.size() >= 6 ? parts[5].c_str() : "");
+				if (g.raceState != "ready" && g.raceState != "running") {
+					g.raceGoShown = false;
+				}
+			}
 		} else if (parts[0] == "TEST") {
 			g.testMode = parts.size() >= 2 && parts[1] == "1";
 		} else if (parts[0] == "POPUP" && parts.size() >= 4) {
 			// item_popup / badge_popup turn the in-game cards off; the console still gets them.
-			if (!(parts[1] == "badge" ? g.config.badgePopups : g.config.itemPopups)) {
+			// Race cards always show.
+			const bool race = parts[1] == "ready" || parts[1] == "notready" || parts[1] == "go" || parts[1] == "finish";
+			if (!race && !(parts[1] == "badge" ? g.config.badgePopups : g.config.itemPopups)) {
 				Say(parts[1] == "badge" ? "GrailTrackrr: badge earned: %s (%s)" : "GrailTrackrr: %s - %s", parts[2].c_str(), parts[3].c_str());
 				continue;
 			}
@@ -1138,6 +1221,66 @@ static auto __cdecl CollectItem(const D2RL::PluginContext*, const D2RL::Items::I
 	return D2RL::Inventory::IterationAction::Continue;
 }
 
+// For races: what the site checks about a race character (with the items the event carries).
+static void RaceFields(std::string& ev, const char* phase) {
+	uint32_t  kills = 0;
+	bool      mp = false, hc = false;
+	int32_t   cls = -1;
+	fs::path  save;
+	{
+		std::lock_guard guard(g.lock);
+		kills = g.killsThisGame;
+		mp    = g.multiplayer;
+		hc    = g.hardcore;
+		cls   = g.charClass;
+		save  = g.charSavePath;
+	}
+	JsonStr(ev, "phase", phase);
+	JsonInt(ev, "kills", kills);
+	JsonBool(ev, "multiplayer", mp);
+	JsonInt(ev, "classId", cls);
+	JsonInt(ev, "sharedGold", SharedStashGold(hc));
+	JsonInt(ev, "saveCreated", save.empty() ? 0 : CreatedMs(save));
+}
+
+// A race check of the loaded character: level, kills, grail items carried and the shared stash.
+static void SendRaceCheck(const std::vector<D2RL::Items::ItemInfo>& items, const std::string& phase) {
+	std::string name;
+	int32_t     clvl = 0;
+	bool        hardcore = false;
+	{
+		std::lock_guard guard(g.lock);
+		name     = g.charName;
+		clvl     = g.clvl;
+		hardcore = g.hardcore;
+	}
+	if (name.empty()) {
+		return;
+	}
+	std::string ev = "{";
+	JsonStr(ev, "type", "racecheck");
+	JsonStr(ev, "charName", name);
+	JsonInt(ev, "clvl", clvl);
+	JsonBool(ev, "hardcore", hardcore);
+	JsonInt(ev, "ts", static_cast<long long>(WallMs()));
+	RaceFields(ev, phase.c_str());
+	JsonKey(ev, "items") += '[';
+	bool first = true;
+	for (const auto& item : items) {
+		if (!IsCandidate(item) && RunewordRow(item) < 0 && item.container != D2RL::Items::ItemContainer::SharedStash) {
+			continue;
+		}
+		if (!first) {
+			ev += ',';
+		}
+		first = false;
+		ItemJson(ev, item, false, RunewordRow(item));
+	}
+	ev += "]}";
+	QueueEvent(std::move(ev));
+	Log("GrailTrackrr: race check sent for %s (%s).", name.c_str(), phase.c_str());
+}
+
 static void SendBaseline(const std::vector<D2RL::Items::ItemInfo>& items, const std::unordered_map<uint64_t, int32_t>& runewords) {
 	const auto saves = ScanSaves();
 	std::string name;
@@ -1179,6 +1322,8 @@ static void SendBaseline(const std::vector<D2RL::Items::ItemInfo>& items, const 
 			name     = newest->name;
 			hardcore = newest->hardcore;
 			level    = newest->level;
+			std::lock_guard guard(g.lock);
+			g.charClass = newest->cls;
 		}
 	}
 	{
@@ -1197,6 +1342,7 @@ static void SendBaseline(const std::vector<D2RL::Items::ItemInfo>& items, const 
 	JsonInt(ev, "clvl", level);
 	JsonBool(ev, "hardcore", hardcore);
 	JsonInt(ev, "ts", static_cast<long long>(WallMs()));
+	RaceFields(ev, "ready");
 	JsonKey(ev, "items") += '[';
 	bool first = true;
 	for (const auto& item : items) {
@@ -1554,6 +1700,14 @@ static void QueuePresence(bool playing) {
 	JsonInt(ev, "clvl", g.clvl);
 	JsonInt(ev, "areaId", g.areaId);
 	JsonInt(ev, "difficulty", g.difficulty);
+	// Racing: the shared stash and the game type, watched for the whole event.
+	if (g.raceState == "running") {
+		JsonKey(ev, "race") += '{';
+		JsonInt(ev, "sharedItems", g.sharedItems);
+		JsonInt(ev, "sharedGold", SharedStashGold(g.hardcore));
+		JsonBool(ev, "multiplayer", g.multiplayer);
+		ev += '}';
+	}
 	ev += '}';
 	QueueEventLocked(std::move(ev));
 	g.presenceDirty   = false;
@@ -1661,6 +1815,20 @@ static void __cdecl ScanOnUiThread(const D2RL::PluginContext* context, void*) no
 		if (g.inventory->forEachInventoryItem(context, player, &filter, CollectItem, &scan) != D2RL::Inventory::Result::Success) {
 			return;
 		}
+		// Races: the shared stash must stay empty, and the site may ask for a check now.
+		std::string raceCheck;
+		{
+			std::lock_guard guard(g.lock);
+			g.sharedItems = static_cast<uint32_t>(std::count_if(scan.items.begin(), scan.items.end(), [](const auto& i) { return i.container == D2RL::Items::ItemContainer::SharedStash; }));
+			if (g.raceCheckPending && !baseline) {
+				g.raceCheckPending = false;
+				g.lastRaceCheckMs  = NowMs();
+				raceCheck          = g.raceCheckPhase;
+			}
+		}
+		if (!raceCheck.empty()) {
+			SendRaceCheck(scan.items, raceCheck);
+		}
 
 		if (baseline) {
 			std::unordered_map<uint64_t, int32_t> runewords;
@@ -1745,8 +1913,10 @@ static void __cdecl ScanOnUiThread(const D2RL::PluginContext* context, void*) no
 				// The game can mark an item as a runeword a moment after the last rune goes in,
 				// so a full white item is checked again on the next few scans, not just once.
 				const bool full    = item.socketCount > 0 && item.socketedItemCount == item.socketCount;
-				const bool sockets = full && tries < 10;
-				if (sockets) {
+				// After the first few scans keep looking now and then: a runeword the game marks
+				// late was missed before (and only found later from the save).
+				const bool sockets = full && (tries < 10 || tries % 30 == 0);
+				if (full && tries < 100'000) {
 					tries++;
 				}
 				checked            = item.socketedItemCount;
@@ -1856,6 +2026,11 @@ static void __cdecl OnGameplayEvent(const D2RL::PluginContext*, const D2RL::Life
 			case K::LocalPlayerReady:
 				g.inGame          = true;
 				g.baselinePending = true;
+				g.killsThisGame   = 0;
+				g.multiplayer     = false;
+				g.localPlayerId   = event->playerId;
+				g.raceCheckPending = g.raceNeedCheck;
+				g.raceCheckPhase  = g.raceState == "running" ? "start" : "ready";
 				g.readyAtMs       = NowMs();
 				g.knownSeeds.clear();
 				g.runeTotals.clear();
@@ -1950,6 +2125,14 @@ static void __cdecl OnMonsterDeath(const D2RL::PluginContext*, const D2RL::Lifec
 	}
 	std::lock_guard guard(g.lock);
 	g.lastKill = LastKill { event->monster.classId, event->levelId, NowMs() };
+	g.killsThisGame++;
+	// Killed by another player (or their summons' owner): this is a multiplayer game.
+	if (event->killer.type == D2RL::Lifecycle::UnitType::Player && g.localPlayerId != 0xFFFFFFFFU && event->killer.id != g.localPlayerId) {
+		if (!g.multiplayer) {
+			Log("GrailTrackrr: another player is in this game.");
+		}
+		g.multiplayer = true;
+	}
 	// Act bosses (Andariel, Duriel, Mephisto, Diablo, Baal): report right away for races.
 	const uint32_t cls = event->monster.classId;
 	if ((cls == 156 || cls == 211 || cls == 242 || cls == 243 || cls == 545) && !g.charName.empty()) {
@@ -2037,6 +2220,10 @@ static constexpr PopupKind PopupKinds[] {
 	{ "eth",      "New ethereal find",    "[0.67, 0.71, 0.75, 1.0]" },
 	{ "sync",     "Offline finds synced", "[0.60, 0.56, 0.48, 1.0]" },
 	{ "badge",    "Badge earned!",        "[0.64, 0.45, 0.90, 1.0]" },
+	{ "ready",    "Race check passed: you are ready", "[0.27, 0.79, 0.42, 1.0]" },
+	{ "notready", "Race check failed: see the race page", "[1.00, 0.45, 0.35, 1.0]" },
+	{ "go",       "GO! The race is on",   "[0.91, 0.72, 0.19, 1.0]" },
+	{ "finish",   "Race finished!",       "[0.91, 0.72, 0.19, 1.0]" },
 	{ "msg",      "GrailTrackrr",         "[0.60, 0.56, 0.48, 1.0]" },
 };
 
@@ -2053,6 +2240,21 @@ static constexpr StatusKind StatusKinds[] {
 	{ "nokey",      "GrailTrackrr: set api_key in grailtrackrr.toml" },
 	{ "error",      "GrailTrackrr: problem, type grailtrackrr in the console" },
 };
+
+// Race line above the status line, by race state.
+struct RaceKind {
+	const char* id;
+	const char* text;
+};
+static constexpr RaceKind RaceKinds[] {
+	{ "check",   "Race: join a game with a new level 1 character to get checked" },
+	{ "ready",   "Race: READY. Wait in town for the start" },
+	{ "waiting", "Race: the challenge opens soon" },
+	{ "running", "Race: on! Good luck" },
+	{ "done",    "Race: finished. Well played" },
+};
+// Countdown digits (M:SS, up to 59:59) after "Race starts in".
+static constexpr int CdX = 28, CdY = -122, CdLabel = 300, CdDigit = 20;
 
 static auto StatusKindFor(const std::string& line) -> const char* {
 	if (line.rfind("GrailTrackrr connected", 0) == 0) return "connected";
@@ -2118,6 +2320,20 @@ static auto BuildPanels(bool center) -> std::vector<PanelDef> {
 		panels.push_back({ std::string("Status_") + k.id,
 			PanelJson(std::string("Status_") + k.id, 0.0F, 1.0F, 8400,
 				Label("Text", Rect(28, -66, 1500, 52), k.text, TextStyle("BlizzardGlobal", "$MediumFontSize", "left"))) });
+	}
+	for (const auto& k : RaceKinds) {
+		panels.push_back({ std::string("Race_") + k.id,
+			PanelJson(std::string("Race_") + k.id, 0.0F, 1.0F, 8400,
+				Label("Text", Rect(28, -122, 1500, 52), k.text, TextStyle("BlizzardGlobal", "$MediumFontSize", "left"))) });
+	}
+	panels.push_back({ "CdText", PanelJson("CdText", 0.0F, 1.0F, 8410, Label("Text", Rect(CdX, CdY - 56, CdLabel, 52), "Race starts in", TextStyle("BlizzardGlobal", "$MediumFontSize", "left"))) });
+	panels.push_back({ "CdColon", PanelJson("CdColon", 0.0F, 1.0F, 8410, Label("Text", Rect(CdX + CdLabel + 2 * CdDigit, CdY - 56, CdDigit / 2 + 4, 52), ":", TextStyle("BlizzardGlobal", "$MediumFontSize", "center"))) });
+	for (int pos = 0; pos < 4; ++pos) {
+		const int x = CdX + CdLabel + pos * CdDigit + (pos >= 2 ? CdDigit / 2 + 4 : 0);
+		for (int d = 0; d <= 9; ++d) {
+			const std::string id = "Cd_" + std::to_string(pos) + "_" + std::to_string(d);
+			panels.push_back({ id, PanelJson(id, 0.0F, 1.0F, 8410, Label("Digit", Rect(x, CdY - 56, CdDigit, 52), std::to_string(d), TextStyle("BlizzardGlobal", "$MediumFontSize", "center"))) });
+		}
 	}
 	for (const auto& k : PopupKinds) {
 		std::string children = R"({"type":"RectangleWidget","name":"Back","fields":{"rect":)" + Rect(CardX, cardY, CardWidth, CardHeight)
@@ -2281,11 +2497,15 @@ static void __cdecl UiTick(const D2RL::PluginContext* context, void*) noexcept {
 		const uint64_t now = NowMs();
 		bool           inGame = false;
 		std::string    status;
+		std::string    race;
+		long long      toStart = 0;
 		std::optional<Popup> next;
 		{
 			std::lock_guard guard(g.lock);
 			inGame = g.inGame;
 			status = g.statusLine;
+			race   = g.raceState;
+			toStart = g.raceStartKnown ? static_cast<long long>(g.raceStartMs) - static_cast<long long>(now) : 0;
 			if (g.config.popupSeconds <= 0.0F) {
 				g.popups.clear();
 			} else if (inGame && !ui.popupShowing && !g.popups.empty() && now >= g.popups.front().notBeforeMs) {
@@ -2311,6 +2531,20 @@ static void __cdecl UiTick(const D2RL::PluginContext* context, void*) noexcept {
 		std::vector<std::string> wanted = ui.popupShown;
 		if (g.config.showStatus) {
 			wanted.push_back(std::string("Status_") + StatusKindFor(status));
+		}
+		// Races: the state line, and a countdown in the last hour before the start.
+		if (std::any_of(std::begin(RaceKinds), std::end(RaceKinds), [&](const RaceKind& k) { return race == k.id; })) {
+			wanted.push_back("Race_" + race);
+			if ((race == "ready" || race == "check" || race == "waiting") && toStart > 0 && toStart < 3'600'000) {
+				const long long secs = (toStart + 999) / 1000;
+				const int       m = static_cast<int>(secs / 60), sec = static_cast<int>(secs % 60);
+				const int       digits[4] = { m / 10, m % 10, sec / 10, sec % 10 };
+				wanted.push_back("CdText");
+				wanted.push_back("CdColon");
+				for (int pos = 0; pos < 4; ++pos) {
+					wanted.push_back("Cd_" + std::to_string(pos) + "_" + std::to_string(digits[pos]));
+				}
+			}
 		}
 		ShowPanels(context, wanted);
 	} catch (...) {
@@ -2453,6 +2687,25 @@ static void WorkerLoop() {
 			if (g.scanQueued && now > g.scanQueuedAtMs + 5'000) {
 				Log("GrailTrackrr: an item scan never ran (the game changed); scanning again.");
 				g.scanQueued = false;
+			}
+			// Races: check again now and then while waiting, and once at the start.
+			{
+				std::lock_guard guard(g.lock);
+				if (inGame && g.raceNeedCheck && !g.raceCheckPending) {
+					const uint64_t every = g.raceState == "check" ? 15'000 : 60'000;
+					const bool     atStart = g.raceStartKnown && g.raceState == "ready" && now >= g.raceStartMs && g.raceCheckPhase != "start";
+					if (atStart) {
+						g.raceCheckPhase   = "start";
+						g.raceCheckPending = true;
+					} else if (now >= g.lastRaceCheckMs + every) {
+						g.raceCheckPending = true;
+					}
+				}
+				// The start: a GO card, even before the server says so.
+				if (inGame && g.raceStartKnown && (g.raceState == "ready" || g.raceState == "running") && now >= g.raceStartMs && now < g.raceStartMs + 30'000 && !g.raceGoShown) {
+					g.raceGoShown = true;
+					g.popups.push_back(Popup { "go", "GO!", g.raceTitle });
+				}
 			}
 			if (inGame && now >= g.nextScanMs && !g.scanQueued.exchange(true)) {
 				g.scanQueuedAtMs = now;
