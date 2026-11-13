@@ -45,7 +45,7 @@
 
 namespace fs = std::filesystem;
 
-static constexpr const char* PluginVersion = "1.1.0";
+static constexpr const char* PluginVersion = "1.1.1";
 
 static constexpr D2RL::PluginInfo GrailTrackrrInfo {
 	.infoSize    = D2RL::PluginInfoSize,
@@ -811,6 +811,9 @@ static void QueueEvent(std::string json) {
 	QueueEventLocked(std::move(json));
 }
 
+// When the last request went out (NowMs), to take half the round trip off race countdowns.
+static std::atomic<uint64_t> requestStartMs { 0 };
+
 static void HandleReply(const std::string& body) {
 	size_t start = 0;
 	while (start < body.size()) {
@@ -845,7 +848,9 @@ static void HandleReply(const std::string& body) {
 			const std::string before = g.raceState;
 			g.raceState     = parts[1];
 			g.raceNeedCheck = parts[2] == "1";
-			const long long toStart = std::atoll(parts[3].c_str());
+			// The server measured "ms to the start" about halfway through the round trip.
+			const long long halfTrip = std::clamp<long long>((static_cast<long long>(NowMs()) - static_cast<long long>(requestStartMs.load())) / 2, 0, 5'000);
+			const long long toStart  = std::atoll(parts[3].c_str()) - halfTrip;
 			g.raceStartMs    = static_cast<uint64_t>(static_cast<long long>(NowMs()) + toStart);
 			g.raceStartKnown = g.raceState != "none";
 			g.raceTitle      = parts.size() >= 5 ? parts[4] : "";
@@ -1026,6 +1031,7 @@ static void __cdecl OnSdkResponse(const D2RL::PluginContext*, const D2RL::Http::
 static void HttpSend(bool post, const std::string& path, const std::string& body, HttpDone done, void* user) {
 	const std::string url  = g.config.serverUrl + path;
 	const std::string auth = "Bearer " + g.config.apiKey;
+	requestStartMs = NowMs();
 	if (!UseWinHttp() && g.http != nullptr) {
 		const D2RL::Http::Header headers[] {
 			{ .name = "Content-Type", .value = "application/json" },
@@ -2250,9 +2256,11 @@ static constexpr RaceKind RaceKinds[] {
 	{ "done",    "Race: finished. Well played" },
 };
 // Countdown in the last hour: one line per step ("Race starts in 10 min"), shown for the
-// smallest step at or above the minutes left. Steps, not digits: D2RLoader allows 64 panels.
+// smallest step at or above the time left; seconds in the last half minute. Steps, not
+// digits: D2RLoader allows 64 panels (this plugin uses 63).
 static constexpr int CdX = 28, CdY = -122;
 static constexpr int CdSteps[] { 60, 45, 30, 20, 15, 10, 5, 4, 3, 2, 1 };
+static constexpr int CdSecs[] { 30, 20, 10, 5, 4, 3, 2, 1 };
 
 static auto StatusKindFor(const std::string& line) -> const char* {
 	if (line.rfind("GrailTrackrr connected", 0) == 0) return "connected";
@@ -2326,7 +2334,12 @@ static auto BuildPanels(bool center) -> std::vector<PanelDef> {
 	}
 	for (const int m : CdSteps) {
 		const std::string id   = "Cd_" + std::to_string(m);
-		const std::string text = m == 1 ? "Race starts in under a minute" : "Race starts in " + std::to_string(m) + " min";
+		const std::string text = "Race starts in " + std::to_string(m) + " min";
+		panels.push_back({ id, PanelJson(id, 0.0F, 1.0F, 8410, Label("Text", Rect(CdX, CdY - 56, 1500, 52), text, TextStyle("BlizzardGlobal", "$MediumFontSize", "left"))) });
+	}
+	for (const int sec : CdSecs) {
+		const std::string id   = "CdS_" + std::to_string(sec);
+		const std::string text = sec <= 5 ? std::to_string(sec) + "..." : "Race starts in " + std::to_string(sec) + " sec";
 		panels.push_back({ id, PanelJson(id, 0.0F, 1.0F, 8410, Label("Text", Rect(CdX, CdY - 56, 1500, 52), text, TextStyle("BlizzardGlobal", "$MediumFontSize", "left"))) });
 	}
 	for (const auto& k : PopupKinds) {
@@ -2538,12 +2551,21 @@ static void __cdecl UiTick(const D2RL::PluginContext* context, void*) noexcept {
 		if (std::any_of(std::begin(RaceKinds), std::end(RaceKinds), [&](const RaceKind& k) { return race == k.id; })) {
 			wanted.push_back("Race_" + race);
 			if ((race == "ready" || race == "check" || race == "waiting") && toStart > 0 && toStart <= 3'600'000) {
-				const long long mins = (toStart + 59'999) / 60'000;   // minutes left, rounded up
-				int step = CdSteps[0];
-				for (const int m : CdSteps) {
-					if (m >= mins) step = m;
+				if (toStart <= 30'000) {
+					const long long secs = (toStart + 999) / 1'000;   // seconds left, rounded up
+					int step = CdSecs[0];
+					for (const int sec : CdSecs) {
+						if (sec >= secs) step = sec;
+					}
+					wanted.push_back("CdS_" + std::to_string(step));
+				} else {
+					const long long mins = (toStart + 59'999) / 60'000;   // minutes left, rounded up
+					int step = CdSteps[0];
+					for (const int m : CdSteps) {
+						if (m >= mins) step = m;
+					}
+					wanted.push_back("Cd_" + std::to_string(step));
 				}
-				wanted.push_back("Cd_" + std::to_string(step));
 			}
 		}
 		ShowPanels(context, wanted);
