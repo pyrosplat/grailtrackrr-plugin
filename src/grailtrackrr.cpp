@@ -45,7 +45,7 @@
 
 namespace fs = std::filesystem;
 
-static constexpr const char* PluginVersion = "1.0.12";
+static constexpr const char* PluginVersion = "1.0.13";
 
 static constexpr D2RL::PluginInfo GrailTrackrrInfo {
 	.infoSize    = D2RL::PluginInfoSize,
@@ -2253,8 +2253,10 @@ static constexpr RaceKind RaceKinds[] {
 	{ "running", "Race: on! Good luck" },
 	{ "done",    "Race: finished. Well played" },
 };
-// Countdown digits (M:SS, up to 59:59) after "Race starts in".
-static constexpr int CdX = 28, CdY = -122, CdLabel = 300, CdDigit = 20;
+// Countdown in the last hour: one line per step ("Race starts in 10 min"), shown for the
+// smallest step at or above the minutes left. Steps, not digits: D2RLoader allows 64 panels.
+static constexpr int CdX = 28, CdY = -122;
+static constexpr int CdSteps[] { 60, 45, 30, 20, 15, 10, 5, 4, 3, 2, 1 };
 
 static auto StatusKindFor(const std::string& line) -> const char* {
 	if (line.rfind("GrailTrackrr connected", 0) == 0) return "connected";
@@ -2326,14 +2328,10 @@ static auto BuildPanels(bool center) -> std::vector<PanelDef> {
 			PanelJson(std::string("Race_") + k.id, 0.0F, 1.0F, 8400,
 				Label("Text", Rect(28, -122, 1500, 52), k.text, TextStyle("BlizzardGlobal", "$MediumFontSize", "left"))) });
 	}
-	panels.push_back({ "CdText", PanelJson("CdText", 0.0F, 1.0F, 8410, Label("Text", Rect(CdX, CdY - 56, CdLabel, 52), "Race starts in", TextStyle("BlizzardGlobal", "$MediumFontSize", "left"))) });
-	panels.push_back({ "CdColon", PanelJson("CdColon", 0.0F, 1.0F, 8410, Label("Text", Rect(CdX + CdLabel + 2 * CdDigit, CdY - 56, CdDigit / 2 + 4, 52), ":", TextStyle("BlizzardGlobal", "$MediumFontSize", "center"))) });
-	for (int pos = 0; pos < 4; ++pos) {
-		const int x = CdX + CdLabel + pos * CdDigit + (pos >= 2 ? CdDigit / 2 + 4 : 0);
-		for (int d = 0; d <= 9; ++d) {
-			const std::string id = "Cd_" + std::to_string(pos) + "_" + std::to_string(d);
-			panels.push_back({ id, PanelJson(id, 0.0F, 1.0F, 8410, Label("Digit", Rect(x, CdY - 56, CdDigit, 52), std::to_string(d), TextStyle("BlizzardGlobal", "$MediumFontSize", "center"))) });
-		}
+	for (const int m : CdSteps) {
+		const std::string id   = "Cd_" + std::to_string(m);
+		const std::string text = m == 1 ? "Race starts in under a minute" : "Race starts in " + std::to_string(m) + " min";
+		panels.push_back({ id, PanelJson(id, 0.0F, 1.0F, 8410, Label("Text", Rect(CdX, CdY - 56, 1500, 52), text, TextStyle("BlizzardGlobal", "$MediumFontSize", "left"))) });
 	}
 	for (const auto& k : PopupKinds) {
 		std::string children = R"({"type":"RectangleWidget","name":"Back","fields":{"rect":)" + Rect(CardX, cardY, CardWidth, CardHeight)
@@ -2345,22 +2343,21 @@ static auto BuildPanels(bool center) -> std::vector<PanelDef> {
 		children += "," + Label("Heading", Rect(CardX + 16, cardY + 10, CardWidth - 32, 50), k.heading, TextStyle("Exocet", "$MediumFontSize", "center"));
 		panels.push_back({ std::string("Card_") + k.cat, PanelJson(std::string("Card_") + k.cat, 0.5F, anchorY, 8500, children) });
 	}
-	// "NN% of your grail found", centred: per length (1, 2 or 3 digits) a panel per digit
-	// and position, then the rest of the line. 100 needs only "1 0 0".
-	for (int len = 1; len <= 3; ++len) {
-		const int start = CardX + (CardWidth - len * PctDigit - PctRest) / 2;
-		for (int pos = 0; pos < len; ++pos) {
-			const int from = len == 3 ? (pos == 0 ? 1 : 0) : 0, to = len == 3 ? from : 9;
-			for (int d = from; d <= to; ++d) {
-				const std::string id = "Pct" + std::to_string(len) + "_" + std::to_string(pos) + "_" + std::to_string(d);
-				panels.push_back({ id, PanelJson(id, 0.5F, anchorY, 8510,
-					Label("Digit", Rect(start + pos * PctDigit, cardY + PctY, PctDigit, 40), std::to_string(d), TextStyle("BlizzardGlobal", "$MediumFontSize", "center"))) });
-			}
-		}
-		const std::string id = "PctText" + std::to_string(len);
-		panels.push_back({ id, PanelJson(id, 0.5F, anchorY, 8510,
-			Label("Text", Rect(start + len * PctDigit, cardY + PctY, PctRest + 40, 40), "% of your grail found", TextStyle("BlizzardGlobal", "$MediumFontSize", "left"))) });
+	// "NN% of your grail found": a tens digit (1-9) and a ones digit (0-9) at fixed places, then
+	// the rest of the line; 100% is one panel. 21 panels (D2RLoader allows 64 per plugin).
+	const int start = CardX + (CardWidth - 2 * PctDigit - PctRest) / 2;
+	for (int d = 1; d <= 9; ++d) {
+		const std::string id = "PctT_" + std::to_string(d);
+		panels.push_back({ id, PanelJson(id, 0.5F, anchorY, 8510, Label("Digit", Rect(start, cardY + PctY, PctDigit, 40), std::to_string(d), TextStyle("BlizzardGlobal", "$MediumFontSize", "center"))) });
 	}
+	for (int d = 0; d <= 9; ++d) {
+		const std::string id = "PctO_" + std::to_string(d);
+		panels.push_back({ id, PanelJson(id, 0.5F, anchorY, 8510, Label("Digit", Rect(start + PctDigit, cardY + PctY, PctDigit, 40), std::to_string(d), TextStyle("BlizzardGlobal", "$MediumFontSize", "center"))) });
+	}
+	panels.push_back({ "PctText", PanelJson("PctText", 0.5F, anchorY, 8510,
+		Label("Text", Rect(start + 2 * PctDigit, cardY + PctY, PctRest + 40, 40), "% of your grail found", TextStyle("BlizzardGlobal", "$MediumFontSize", "left"))) });
+	panels.push_back({ "Pct100", PanelJson("Pct100", 0.5F, anchorY, 8510,
+		Label("Text", Rect(CardX, cardY + PctY, CardWidth, 40), "100% of your grail found!", TextStyle("BlizzardGlobal", "$MediumFontSize", "center"))) });
 	return panels;
 }
 
@@ -2402,6 +2399,9 @@ static void SetUpPanels(const D2RL::PluginContext* context) {
 		return fail("panel service version " + std::to_string(g.panels->serviceVersion) + " size " + std::to_string(g.panels->serviceSize));
 	}
 	ui.panels = BuildPanels(g.config.popupCenter);
+	if (ui.panels.size() > 64) {
+		Log("GrailTrackrr: %zu panels is over D2RLoader's limit of 64.", ui.panels.size());
+	}
 	for (auto& p : ui.panels) {
 		const std::string path = "data/global/ui/layouts/grailtrackrr/" + p.id + "hd.json";
 		const D2RL::Resources::ResourceRegistration resource {
@@ -2416,7 +2416,12 @@ static void SetUpPanels(const D2RL::PluginContext* context) {
 		}
 		const D2RL::Panels::PanelRegistration reg { .structSize = D2RL::Panels::PanelRegistrationSize, .flags = D2RL::Panels::PanelFlags::None, .localId = p.id.c_str() };
 		if (const auto r = g.panels->registerPanel(context, &reg, &p.handle); r != D2RL::Panels::Result::Success) {
-			return fail("registering panel " + p.id + " returned " + std::to_string(static_cast<uint32_t>(r)));
+			// Keep the ones already registered (the status line comes first) rather than none.
+			Log("GrailTrackrr: registering panel %s returned %u; showing the %zu panels before it.", p.id.c_str(), static_cast<uint32_t>(r), static_cast<size_t>(&p - ui.panels.data()));
+			panelSetup = "partial: " + p.id + " returned " + std::to_string(static_cast<uint32_t>(r));
+			ui.panels.resize(static_cast<size_t>(&p - ui.panels.data()));
+			ui.ready = !ui.panels.empty();
+			return;
 		}
 	}
 	panelSetup = "ok";
@@ -2475,13 +2480,14 @@ static auto PopupPanels(const Popup& p) -> std::vector<std::string> {
 			--start;
 		}
 		if (start < pctAt) {
-			const int         pct    = std::clamp(static_cast<int>(std::atof(p.detail.substr(start, pctAt - start).c_str())), 0, 100);
-			const std::string digits = std::to_string(pct);
-			const auto        len    = std::to_string(digits.size());
-			for (size_t pos = 0; pos < digits.size(); ++pos) {
-				shown.push_back("Pct" + len + "_" + std::to_string(pos) + "_" + digits[pos]);
+			const int pct = std::clamp(static_cast<int>(std::atof(p.detail.substr(start, pctAt - start).c_str())), 0, 100);
+			if (pct == 100) {
+				shown.push_back("Pct100");
+			} else {
+				if (pct >= 10) shown.push_back("PctT_" + std::to_string(pct / 10));
+				shown.push_back("PctO_" + std::to_string(pct % 10));
+				shown.push_back("PctText");
 			}
-			shown.push_back("PctText" + len);
 		}
 	}
 	return shown;
@@ -2535,15 +2541,13 @@ static void __cdecl UiTick(const D2RL::PluginContext* context, void*) noexcept {
 		// Races: the state line, and a countdown in the last hour before the start.
 		if (std::any_of(std::begin(RaceKinds), std::end(RaceKinds), [&](const RaceKind& k) { return race == k.id; })) {
 			wanted.push_back("Race_" + race);
-			if ((race == "ready" || race == "check" || race == "waiting") && toStart > 0 && toStart < 3'600'000) {
-				const long long secs = (toStart + 999) / 1000;
-				const int       m = static_cast<int>(secs / 60), sec = static_cast<int>(secs % 60);
-				const int       digits[4] = { m / 10, m % 10, sec / 10, sec % 10 };
-				wanted.push_back("CdText");
-				wanted.push_back("CdColon");
-				for (int pos = 0; pos < 4; ++pos) {
-					wanted.push_back("Cd_" + std::to_string(pos) + "_" + std::to_string(digits[pos]));
+			if ((race == "ready" || race == "check" || race == "waiting") && toStart > 0 && toStart <= 3'600'000) {
+				const long long mins = (toStart + 59'999) / 60'000;   // minutes left, rounded up
+				int step = CdSteps[0];
+				for (const int m : CdSteps) {
+					if (m >= mins) step = m;
 				}
+				wanted.push_back("Cd_" + std::to_string(step));
 			}
 		}
 		ShowPanels(context, wanted);
