@@ -5,8 +5,9 @@
 .DESCRIPTION
   1. Installs Git, CMake, Ninja and Visual Studio 2022 Build Tools (C++ workload) with winget if missing.
   2. Downloads the D2RLoader PluginSDK into sdk\PluginSDK (or updates it).
-  3. Builds d2rl-grailtrackrr.dll and copies it with the default config into dist.
-  4. Optionally copies the DLL into your game's d2rloader\plugins folder.
+  3. Builds d2rl-grailtrackrr.dll and lays out the release in dist: instructions.txt,
+     d2rloader\plugins with the DLL, and mods with the GrailTrackrr and GrailTrackrrRace mods.
+  4. Optionally copies both folders into your game folder.
 
 .EXAMPLE
   .\build.ps1
@@ -15,7 +16,7 @@
 #>
 [CmdletBinding()]
 param(
-	# Game folder (the one with D2R.exe). When set, the DLL is copied to <GameDir>\d2rloader\plugins.
+	# Game folder (the one with D2R.exe). When set, dist\d2rloader and dist\mods are copied into it.
 	[string]$GameDir = "",
 	# PluginSDK branch, tag or commit. The plugin needs SDK 0.4.0 or newer (the v4 tag is too old).
 	[string]$SdkRef = "master",
@@ -174,37 +175,25 @@ Run $cmake @("--build", $BuildDir)
 $dll = Get-ChildItem -Path $BuildDir -Recurse -Filter "d2rl-grailtrackrr.dll" | Select-Object -First 1
 if (-not $dll) { Fail "Build finished but d2rl-grailtrackrr.dll was not found in $BuildDir" }
 
-New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
-Copy-Item $dll.FullName $DistDir -Force
-Copy-Item (Join-Path $Root "grailtrackrr.toml") $DistDir -Force
-Info "Output: $DistDir\d2rl-grailtrackrr.dll"
+# dist holds exactly what goes in the release zip.
+if (Test-Path $DistDir) { Remove-Item -Recurse -Force $DistDir }
+Copy-Item (Join-Path $Root "package") $DistDir -Recurse
+$plugins = Join-Path $DistDir "d2rloader\plugins"
+New-Item -ItemType Directory -Force -Path $plugins | Out-Null
+Copy-Item $dll.FullName $plugins -Force
+Copy-Item (Join-Path $Root "grailtrackrr.toml") $plugins -Force
+Info "Output: $DistDir"
 
 # ---------------------------------------------------------------------------
 if ($GameDir) {
 	Step "Installing into the game folder"
 	if (-not (Test-Path $GameDir)) { Fail "Game folder not found: $GameDir" }
 	if (-not (Test-Path (Join-Path $GameDir "D2R.exe"))) { Write-Warning "D2R.exe not found in $GameDir. Copying anyway." }
-	$plugins = Join-Path $GameDir "d2rloader\plugins"
-	New-Item -ItemType Directory -Force -Path $plugins | Out-Null
-	Copy-Item (Join-Path $DistDir "d2rl-grailtrackrr.dll") $plugins -Force
-	Info "Copied to $plugins"
-
-	# The plugin used to be called Live Grail. Remove the old DLL so it does not run twice,
-	# and carry the old settings over to the new config name.
-	$oldDll = Join-Path $plugins "d2rl-live-grail.dll"
+	Copy-Item (Join-Path $DistDir "d2rloader") $GameDir -Recurse -Force
+	Copy-Item (Join-Path $DistDir "mods") $GameDir -Recurse -Force
+	Info "Copied the plugin to $(Join-Path $GameDir 'd2rloader\plugins') and the mods to $(Join-Path $GameDir 'mods')"
+	$oldDll = Join-Path $GameDir "d2rloader\plugins\d2rl-live-grail.dll"
 	if (Test-Path $oldDll) { Remove-Item $oldDll -Force; Info "Removed the old d2rl-live-grail.dll" }
-	$configDir = Join-Path $GameDir "d2rloader\config"
-	$oldConfig = Join-Path $configDir "live-grail.toml"
-	$userConfig = Join-Path $configDir "grailtrackrr.toml"
-	if ((Test-Path $oldConfig) -and -not (Test-Path $userConfig)) {
-		(Get-Content $oldConfig -Raw) -replace '\[live-grail\]', '[grailtrackrr]' | Set-Content $userConfig -Encoding utf8
-		Info "Copied your settings from live-grail.toml to grailtrackrr.toml"
-	}
-	if (Test-Path $userConfig) {
-		Info "Existing config kept: $userConfig"
-	} else {
-		Info "D2RLoader creates $userConfig on the next launch. Set server_url and api_key there."
-	}
 }
 
 Write-Host "`nDone." -ForegroundColor Green

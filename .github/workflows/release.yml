@@ -43,7 +43,7 @@ jobs:
           $zip = "grailtrackrr-plugin-$name.zip"
           Compress-Archive -Path dist\* -DestinationPath $zip
           "ZIP=$zip" | Out-File $env:GITHUB_ENV -Append
-          "DLL_SHA=$((Get-FileHash dist\d2rl-grailtrackrr.dll -Algorithm SHA256).Hash.ToLower())" | Out-File $env:GITHUB_ENV -Append
+          "DLL_SHA=$((Get-FileHash dist\d2rloader\plugins\d2rl-grailtrackrr.dll -Algorithm SHA256).Hash.ToLower())" | Out-File $env:GITHUB_ENV -Append
           "ZIP_SHA=$((Get-FileHash $zip -Algorithm SHA256).Hash.ToLower())" | Out-File $env:GITHUB_ENV -Append
 
       - uses: actions/upload-artifact@v4
@@ -65,7 +65,7 @@ jobs:
           $changes
 
           ## Install
-          Copy ``d2rl-grailtrackrr.dll`` into ``<game folder>\d2rloader\plugins``. Setup steps are in the [README](https://github.com/$($env:GITHUB_REPOSITORY)#install).
+          Drag the ``d2rloader`` and ``mods`` folders from the zip into your game folder, then follow ``instructions.txt`` (also in the [README](https://github.com/$($env:GITHUB_REPOSITORY)#install)).
 
           ## SHA-256
           - ``d2rl-grailtrackrr.dll``: ``$($env:DLL_SHA)``

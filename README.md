@@ -5,13 +5,16 @@ D2RLoader plugin for Diablo II: Resurrected (offline) that sends your Holy Grail
 Created by PyroSplat. Not affiliated with Blizzard Entertainment.
 
 ## Install
-1. Install [D2RLoader](https://d2rloader.net/download.html) and check the game starts with it.
-2. Get GrailTrackrr from the [D2RLoader plugin hub](https://d2rloader.net/hub/plugins/grailtrackrr-live-grail-sharing) (or [Releases](https://github.com/pyrosplat/grailtrackrr-plugin/releases/latest) here) and copy `d2rl-grailtrackrr.dll` into `<game folder>\d2rloader\plugins`. Each GitHub release lists the file's SHA-256 so you can check your download.
-3. Start the game once. D2RLoader creates `<game folder>\d2rloader\config\grailtrackrr.toml`.
-4. Sign up at grailtrackrr.com, open **Profile**, copy your API key and paste it as `api_key` in that file.
-5. Start a grail on the site, then load a new level 1 character with an empty shared stash. The grail starts on its own.
+One plugin plus two small mods with their own save folders: `GrailTrackrr` for your grail, `GrailTrackrrRace` for races and challenges. The plugin only tracks while one of them runs; with no mod or any other mod it stays off.
 
-In game, the console command `grailtrackrr` shows the connection status.
+1. Install [D2RLoader](https://d2rloader.net/download.html) and check the game starts with it.
+2. Download the zip from the [D2RLoader plugin hub](https://d2rloader.net/hub/plugins/grailtrackrr-live-grail-sharing) or [Releases](https://github.com/pyrosplat/grailtrackrr-plugin/releases/latest) and drag its `d2rloader` and `mods` folders into your game folder.
+3. In D2RLoader, **General > Startup > Default mod**: pick `GrailTrackrr` (keep "Allow mod extensions" on). Start the game once.
+4. Sign up at grailtrackrr.com, open **Profile**, copy your API key and paste it as `api_key` in `<game folder>\d2rloader\config\grailtrackrr.toml`.
+5. Start a grail on the site and make a new level 1 character. The grail starts on its own.
+
+For a race or challenge, pick `GrailTrackrrRace` instead and make a new level 1 character. Races never count toward your grail.
+Full steps, including moving an existing grail, are in `instructions.txt`. In game, the console command `grailtrackrr` shows the status.
 
 ## Settings (`grailtrackrr.toml`)
 | Key | Default | |
@@ -32,16 +35,16 @@ Only to the `server_url` you set, signed with your API key:
 - **Races and challenges** (only while you are in one): act boss kills and quests completed, and a check of the race character: level, monsters killed this game, grail items carried, shared stash items and gold, whether it is a TCP/IP game, and when its save file was made.
 - **Save folder check**: the names and levels of the characters in your save folder and whether the shared stash is empty, used to confirm a clean grail start.
 
-Nothing else from your PC. If the server cannot be reached, unsent events wait in `%LOCALAPPDATA%\GrailTrackrr\outbox.jsonl` and go out on the next connection.
+Nothing else from your PC. If the server cannot be reached, unsent events wait in `%LOCALAPPDATA%\GrailTrackrr\outbox-<grail|race>.jsonl` and go out on the next connection.
 
-## Upgrading from "Live Grail"
-Delete the old `d2rl-live-grail.dll` from the plugins folder. Until `grailtrackrr.toml` has a key, the plugin reads your old `live-grail.toml`.
+## Upgrading from 1.0
+Drag the new folders in, pick the `GrailTrackrr` mod and copy your grail characters and shared stash into `Saved Games\Diablo II Resurrected\mods\GrailTrackrr`. Your settings stay. The site only accepts 1.1.0 and newer, run under one of the two mods.
 
 ## Problems or questions
 Open an [issue](https://github.com/pyrosplat/grailtrackrr-plugin/issues). Include the D2RLoader log lines that start with `GrailTrackrr`.
 
 ## Build it yourself
-Double-click `build.cmd` (it installs anything missing with winget and fetches the [D2RLoader PluginSDK](https://github.com/D2RLoader/PluginSDK)). The DLL lands in `dist\`. `.\build.ps1 -GameDir "<game folder>"` also installs it.
+Double-click `build.cmd` (it installs anything missing with winget and fetches the [D2RLoader PluginSDK](https://github.com/D2RLoader/PluginSDK)). The release layout lands in `dist\`. `.\build.ps1 -GameDir "<game folder>"` also copies it into the game.
 
 Test accounts (set by a site admin) can spawn items to test with: `grailtrackrr spawn <item name | set name | random>` in the D2RLoader console.
 `grailtrackrr popup` shows a test popup.

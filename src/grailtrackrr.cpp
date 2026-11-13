@@ -45,7 +45,7 @@
 
 namespace fs = std::filesystem;
 
-static constexpr const char* PluginVersion = "1.0.13";
+static constexpr const char* PluginVersion = "1.1.0";
 
 static constexpr D2RL::PluginInfo GrailTrackrrInfo {
 	.infoSize    = D2RL::PluginInfoSize,
@@ -64,7 +64,6 @@ static constexpr D2RL::PluginInfo GrailTrackrrInfo {
 struct Config {
 	std::string serverUrl = "https://grailtrackrr.com";
 	std::string apiKey;
-	std::string saveFolder;
 	float       popupSeconds = 6.0F;
 	bool        popupCenter  = false;
 	bool        showStatus   = true;
@@ -194,6 +193,8 @@ struct State {
 	// Spawned items not yet picked up: their finds are reported as "test". code|quality|row -> expiry.
 	std::unordered_map<std::string, uint64_t> spawnedPending;
 	std::string                  statusLine   = "GrailTrackrr: connecting";
+	// "grail" under the GrailTrackrr mod, "race" under GrailTrackrrRace, empty (off) anywhere else.
+	std::string                  mode;
 	std::string                  lastError;
 	bool                         pinging      = false;
 	uint64_t                     nextPingMs   = 0;
@@ -323,8 +324,6 @@ static void ParseConfig(const std::string& text) {
 			}
 		} else if (key == "api_key") {
 			g.config.apiKey = value;
-		} else if (key == "save_folder") {
-			g.config.saveFolder = value;
 		} else if (key == "popup_seconds") {
 			// 0 turns the popup off.
 			const float seconds = static_cast<float>(std::atof(value.c_str()));
@@ -360,20 +359,18 @@ static void LoadConfig() {
 	}
 	text.resize(std::strlen(text.c_str()));
 	ParseConfig(text);
+}
 
-	// Before the rename the plugin was "Live Grail" with live-grail.toml. If the new file has
-	// no key yet, take the settings from the old file next to it so nothing needs re-entering.
-	if (g.config.apiKey.empty() && g.ctx->pluginConfigPath != nullptr) {
-		const fs::path old = fs::path(g.ctx->pluginConfigPath).parent_path() / L"live-grail.toml";
-		std::ifstream  in(old, std::ios::binary);
-		if (in) {
-			const std::string oldText((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-			ParseConfig(oldText);
-			if (!g.config.apiKey.empty()) {
-				Log("GrailTrackrr: using server_url and api_key from the old live-grail.toml. Copy them into grailtrackrr.toml when convenient.");
-			}
-		}
+// Which of our two mods is running. Anything else leaves the plugin off.
+static auto ModeOf(const char* mod) -> std::string {
+	const std::string name = mod != nullptr ? mod : "";
+	if (name == "GrailTrackrr") {
+		return "grail";
 	}
+	if (name == "GrailTrackrrRace") {
+		return "race";
+	}
+	return {};
 }
 
 // ---------------------------------------------------------------------------
@@ -445,25 +442,19 @@ static auto ToUtf8(const fs::path& p) -> std::string {
 	return std::string(s.begin(), s.end());
 }
 
+// Always the active mod's own save folder (savepath in its modinfo.json), so only characters made
+// under the GrailTrackrr or GrailTrackrrRace mod are ever read.
 static auto SaveFolder() -> fs::path {
-	if (!g.config.saveFolder.empty()) {
-		return FromUtf8(g.config.saveFolder);
-	}
 	PWSTR raw = nullptr;
 	fs::path base;
 	if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_SavedGames, 0, nullptr, &raw)) && raw != nullptr) {
 		base = fs::path(raw) / L"Diablo II Resurrected";
 	}
 	CoTaskMemFree(raw);
-	// Mods that use their own save folder keep it under mods/<mod>.
-	if (g.ctx->activeMod != nullptr && g.ctx->activeMod[0] != '\0') {
-		const fs::path modSaves = base / L"mods" / FromUtf8(g.ctx->activeMod);
-		std::error_code ec;
-		if (fs::is_directory(modSaves, ec)) {
-			return modSaves;
-		}
+	if (base.empty() || g.ctx->activeMod == nullptr || g.ctx->activeMod[0] == '\0') {
+		return {};
 	}
-	return base;
+	return base / L"mods" / FromUtf8(g.ctx->activeMod);
 }
 
 // D2S header layout depends on the save version (uint32 at offset 4).
@@ -797,6 +788,9 @@ static auto IsType(const std::string& json, const char* type) -> bool {
 
 // Caller holds g.lock.
 static void QueueEventLocked(std::string json) {
+	if (g.mode.empty()) {
+		return;
+	}
 	if (g.session != 0 && json.size() > 2 && json.front() == '{' && json.find("\"session\":") == std::string::npos) {
 		json.insert(1, "\"session\":" + std::to_string(g.session) + ",");
 	}
@@ -840,7 +834,7 @@ static void HandleReply(const std::string& body) {
 		std::lock_guard guard(g.lock);
 		if (parts[0] == "STATUS" && parts.size() >= 3) {
 			if (parts[1] == "active") {
-				g.statusLine = "GrailTrackrr connected: " + parts[2];
+				g.statusLine = std::string(g.mode == "race" ? "GrailTrackrr connected (Race): " : "GrailTrackrr connected (Grail): ") + parts[2];
 			} else if (parts[1] == "pending") {
 				g.statusLine = "GrailTrackrr not started: " + parts[2];
 			} else {
@@ -1037,13 +1031,14 @@ static void HttpSend(bool post, const std::string& path, const std::string& body
 			{ .name = "Content-Type", .value = "application/json" },
 			{ .name = "Accept", .value = "text/plain" },
 			{ .name = "Authorization", .value = auth.c_str() },
+			{ .name = "X-GrailTrackrr-Mode", .value = g.mode.c_str() },
 		};
 		const D2RL::Http::Request request {
 			.structSize  = D2RL::Http::RequestSize,
 			.method      = post ? D2RL::Http::Method::Post : D2RL::Http::Method::Get,
 			.timeoutMs   = 15'000,
 			.url         = url.c_str(),
-			.headerCount = post ? 3U : 2U,
+			.headerCount = post ? 4U : 3U,
 			.bodySize    = static_cast<uint32_t>(body.size()),
 			.headers     = post ? headers : headers + 1,
 			.body        = body.empty() ? nullptr : body.data(),
@@ -1059,7 +1054,7 @@ static void HttpSend(bool post, const std::string& path, const std::string& body
 		forceWinHttp = true;
 		Log("GrailTrackrr: D2RLoader HTTP service refused the request (%s); using Windows HTTP instead.", ResultName(sent));
 	}
-	std::vector<std::pair<std::string, std::string>> headers { { "Accept", "text/plain" }, { "Authorization", auth } };
+	std::vector<std::pair<std::string, std::string>> headers { { "Accept", "text/plain" }, { "Authorization", auth }, { "X-GrailTrackrr-Mode", g.mode } };
 	if (post) {
 		headers.insert(headers.begin(), { "Content-Type", "application/json" });
 	}
@@ -1150,6 +1145,7 @@ static void TrySend() {
 	// sentAt lets the server correct for a PC clock that is off.
 	std::string body = "{\"plugin\":{\"version\":\"";
 	body += PluginVersion;
+	body += "\",\"mode\":\"" + g.mode;
 	body += "\",\"sentAt\":" + std::to_string(WallMs()) + "},\"events\":[";
 	for (size_t i = 0; i < batch->size(); ++i) {
 		if (i != 0) {
@@ -2577,7 +2573,8 @@ static auto OutboxPath() -> fs::path {
 		dir = fs::path(raw) / L"GrailTrackrr";
 	}
 	CoTaskMemFree(raw);
-	return dir.empty() ? fs::path() : dir / L"outbox.jsonl";
+	// One queue per mod, so grail finds never go out as race events or the other way round.
+	return dir.empty() || g.mode.empty() ? fs::path() : dir / (L"outbox-" + FromUtf8(g.mode).wstring() + L".jsonl");
 }
 
 static std::vector<std::string> savedOutbox;
@@ -2631,14 +2628,6 @@ static void SaveOutbox() {
 static void LoadOutbox() {
 	const fs::path path = OutboxPath();
 	std::error_code ec;
-	// Unsent finds saved by the plugin before it was renamed (LiveGrail folder).
-	if (!path.empty() && !fs::exists(path, ec)) {
-		const fs::path old = path.parent_path().parent_path() / L"LiveGrail" / L"outbox.jsonl";
-		if (fs::exists(old, ec)) {
-			fs::create_directories(path.parent_path(), ec);
-			fs::rename(old, path, ec);
-		}
-	}
 	if (path.empty() || !fs::exists(path, ec)) {
 		return;
 	}
@@ -3016,6 +3005,8 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 	g.ctx = context;
 	try {
 		LoadConfig();
+		// One global plugin; it only tracks while the GrailTrackrr or GrailTrackrrRace mod is running.
+		g.mode = ModeOf(context->activeMod);
 
 		Log("GrailTrackrr %s starting (D2RLoader build %s).", PluginVersion, D2RL::GetBuildVersion(context) != nullptr ? D2RL::GetBuildVersion(context) : "unknown");
 		const D2RL::LifecycleService*   lifecycle = nullptr;
@@ -3097,6 +3088,13 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 		(void)context->RegisterConsoleCommand("grailtrackrr", StatusCommand, "Show GrailTrackrr connection and tracking status.");
 
 		const std::string configPath = context->pluginConfigPath != nullptr ? ToUtf8(fs::path(context->pluginConfigPath)) : "grailtrackrr.toml";
+		if (g.mode.empty()) {
+			// Not one of our mods: nothing is read or sent.
+			g.statusLine = "GrailTrackrr: off (start the game with the GrailTrackrr or GrailTrackrrRace mod)";
+			Log("GrailTrackrr %s: active mod is \"%s\", not GrailTrackrr or GrailTrackrrRace; tracking is off.", PluginVersion,
+				context->activeMod != nullptr ? context->activeMod : "");
+			return true;
+		}
 		if (g.config.serverUrl.empty() || g.config.apiKey.empty()) {
 			g.statusLine = "GrailTrackrr: set api_key in " + configPath;
 		} else if (g.config.serverUrl.rfind("http://", 0) == 0 && g.config.serverUrl.find("localhost") == std::string::npos && g.config.serverUrl.find("127.0.0.1") == std::string::npos) {
@@ -3107,7 +3105,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 		}
 		workerStop = false;
 		worker     = std::thread(WorkerLoop);
-		Log("GrailTrackrr %s loaded. Config: %s. Server: %s. API key: %s", PluginVersion, configPath.c_str(), g.config.serverUrl.c_str(),
+		Log("GrailTrackrr %s loaded (%s mode). Config: %s. Server: %s. API key: %s", PluginVersion, g.mode.c_str(), configPath.c_str(), g.config.serverUrl.c_str(),
 			g.config.apiKey.empty() ? "missing" : "set");
 		return true;
 	} catch (...) {

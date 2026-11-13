@@ -1,5 +1,6 @@
 # GrailTrackrr plugin settings.
 # D2RLoader copies this to d2rloader/config/grailtrackrr.toml the first time it runs.
+# Tracking only runs with the GrailTrackrr (grail) or GrailTrackrrRace (races) mod.
 
 [grailtrackrr]
 # From the Profile page on grailtrackrr.com. Keep it private.

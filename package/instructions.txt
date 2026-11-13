@@ -1,0 +1,65 @@
+GrailTrackrr - setup
+====================
+
+One plugin plus two small mods. Each mod has its own save folder, so the characters
+you track stay apart from everything else you play.
+
+  GrailTrackrr       your Holy Grail
+  GrailTrackrrRace   races and challenges
+
+Saves go to:
+  Saved Games\Diablo II Resurrected\mods\GrailTrackrr\
+  Saved Games\Diablo II Resurrected\mods\GrailTrackrrRace\
+
+The plugin only tracks while one of these two mods is running. With no mod or any
+other mod, it stays off and sends nothing.
+
+
+SETUP
+-----
+1. Install D2RLoader (https://d2rloader.net) and check the game starts with it.
+
+2. Drag the "d2rloader" and "mods" folders from this zip into your game folder
+   (the folder with D2R.exe). If Windows asks, choose to merge the folders.
+
+3. Sign up at https://grailtrackrr.com, open Profile and copy your API key.
+
+4. In D2RLoader, open General > Startup and set "Default mod" to GrailTrackrr.
+   Leave "Allow mod extensions" on. Start the game once, then close it.
+
+5. Open <game folder>\d2rloader\config\grailtrackrr.toml in Notepad and paste
+   your key between the quotes:  api_key = "your key"
+
+6. On the site, start a grail. In game, make a new level 1 character (the shared
+   stash of a new mod starts empty). Your grail goes live on its own.
+
+The bottom-left corner shows "GrailTrackrr connected (Grail)" when it works.
+The console command "grailtrackrr" shows the status too.
+
+
+ALREADY ON A GRAIL?
+-------------------
+Copy your grail characters (.d2s files) and your shared stash file
+(SharedStashSoftCoreV2.d2i or SharedStashHardCoreV2.d2i) from
+  Saved Games\Diablo II Resurrected\
+into
+  Saved Games\Diablo II Resurrected\mods\GrailTrackrr\
+and keep going. Copy only characters your grail already has: any other
+character is flagged. Your api_key from before stays as it is.
+
+
+RACES AND CHALLENGES
+--------------------
+Join the event on the site, set "Default mod" to GrailTrackrrRace, and make a new
+level 1 character when the event starts. Nothing from races counts toward your
+grail.
+
+
+GOOD TO KNOW
+------------
+- Playing without these mods (no mod, or another mod) is not tracked.
+- Other mods (D2RMM and similar) are not active while GrailTrackrr is the mod.
+- Updating: drag the new folders in again. Your settings and key are kept.
+- Help: https://github.com/pyrosplat/grailtrackrr-plugin/issues
+
+Created by PyroSplat. Not affiliated with Blizzard Entertainment.
